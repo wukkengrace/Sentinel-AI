@@ -1,0 +1,15 @@
+# ── Python dependencies ───────────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+pydantic==2.7.1
+crewai==0.30.11
+crewai-tools==0.4.6
+langchain-community==0.2.1
+chromadb==0.5.0
+pymupdf==1.24.3          # PDF text extraction (fitz)
+python-multipart==0.0.9
+
+# ── Frontend (npm, not pip) ───────────────────────────────────────────────
+# Run inside /frontend: npm create vite@latest . -- --template react
+# Then: npm install
+# Leaflet loaded via CDN in Dashboard.jsx (no npm needed)

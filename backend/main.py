@@ -11,6 +11,11 @@ Endpoints:
   GET  /api/stream/{id}        — SSE stream of agent thought trace
 """
 
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import json
 import asyncio
 import threading
@@ -24,7 +29,7 @@ from pydantic import BaseModel, Field
 
 from database import get_connection, init_db
 from haversine import rank_resources, nearest_agency
-from agents import build_crew, simulate_vip_bribe
+from agents import run_crew_and_dispatch, simulate_vip_bribe
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(title="Sentinel-AI", version="1.0", description="Incorruptible TVM Dispatcher")
@@ -89,13 +94,14 @@ def _run_crew_async(incident: dict):
     _push_sse(incident_id, f"[Comm Director] Received triage for incident #{incident_id}")
     _push_sse(incident_id, f"[Strategy Lead] Starting legal audit...")
 
+    def push(msg: str):
+        _push_sse(incident_id, msg)
+
     try:
-        crew = build_crew(incident)
-        result = crew.kickoff()
-        _push_sse(incident_id, f"[Operations] Dispatch complete.")
-        _push_sse(incident_id, f"[DONE] {str(result)[:300]}")
+        result = run_crew_and_dispatch(incident, push)
+        _push_sse(incident_id, f"[DONE] {result}")
     except Exception as e:
-        _push_sse(incident_id, f"[ERROR] Agent crew failed: {str(e)}")
+        _push_sse(incident_id, f"[ERROR] {str(e)}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -240,7 +246,7 @@ async def stream_thought_trace(incident_id: int):
     """
     async def event_generator() -> AsyncGenerator[str, None]:
         sent = 0
-        timeout = 120  # seconds
+        timeout = 900  # seconds (15 mins)
         elapsed = 0
 
         while elapsed < timeout:

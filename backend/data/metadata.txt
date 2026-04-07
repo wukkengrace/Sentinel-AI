@@ -1,0 +1,317 @@
+[
+    {
+        "original_filename": "BillsTexts_LSBillTexts_Asintroduced_disaster812",
+        "mapped_filename": "Disaster-Bill-2024.pdf",
+        "title": "Disaster Management (Amendment) Bill, 2024",
+        "category": "Bill",
+        "jurisdiction": "National",
+        "pages": 34,
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "bill",
+            "national"
+        ]
+    },
+    {
+        "original_filename": "1-Thiruvananthapuram-final",
+        "mapped_filename": "Thiruvananthapuram-Plan.pdf",
+        "title": "Hospital Disaster Management Plan for Thiruvananthapuram",
+        "category": "Hospital Plan",
+        "jurisdiction": "Kerala (District)",
+        "pages": "N/A",
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "hospital-plan",
+            "kerala (district)"
+        ]
+    },
+    {
+        "original_filename": "English-E-version-DRR_compressed-1",
+        "mapped_filename": "English-E-version-DRR.pdf",
+        "title": "English Version of Disaster Risk Reduction Report",
+        "category": "Report",
+        "jurisdiction": "Kerala",
+        "pages": "N/A",
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "report",
+            "kerala"
+        ]
+    },
+    {
+        "original_filename": "general-hospital-alappuzha",
+        "mapped_filename": "Alappuzha-Plan.pdf",
+        "title": "Hospital Disaster Management Plan for Alappuzha",
+        "category": "Hospital Plan",
+        "jurisdiction": "Kerala (District)",
+        "pages": "N/A",
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "hospital-plan",
+            "kerala (district)"
+        ]
+    },
+    {
+        "original_filename": "general-hospital-ernakulam",
+        "mapped_filename": "Ernakulam-Plan.pdf",
+        "title": "Hospital Disaster Management Plan for Ernakulam",
+        "category": "Hospital Plan",
+        "jurisdiction": "Kerala (District)",
+        "pages": "N/A",
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "hospital-plan",
+            "kerala (district)"
+        ]
+    },
+    {
+        "original_filename": "general-hospital-idukki",
+        "mapped_filename": "Idukki-Plan.pdf",
+        "title": "Hospital Disaster Management Plan for Idukki",
+        "category": "Hospital Plan",
+        "jurisdiction": "Kerala (District)",
+        "pages": "N/A",
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "hospital-plan",
+            "kerala (district)"
+        ]
+    },
+    {
+        "original_filename": "general-hospital-kannur",
+        "mapped_filename": "Kannur-Plan.pdf",
+        "title": "Hospital Disaster Management Plan for Kannur",
+        "category": "Hospital Plan",
+        "jurisdiction": "Kerala (District)",
+        "pages": "N/A",
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "hospital-plan",
+            "kerala (district)"
+        ]
+    },
+    {
+        "original_filename": "general-hospital-kasargod",
+        "mapped_filename": "Kasaragod-Plan.pdf",
+        "title": "Hospital Disaster Management Plan for Kasaragod",
+        "category": "Hospital Plan",
+        "jurisdiction": "Kerala (District)",
+        "pages": "N/A",
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "hospital-plan",
+            "kerala (district)"
+        ]
+    },
+    {
+        "original_filename": "general-hospital-kollam",
+        "mapped_filename": "Kollam-Plan.pdf",
+        "title": "Hospital Disaster Management Plan for Kollam",
+        "category": "Hospital Plan",
+        "jurisdiction": "Kerala (District)",
+        "pages": "N/A",
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "hospital-plan",
+            "kerala (district)"
+        ]
+    },
+    {
+        "original_filename": "general-hospital-kottayam",
+        "mapped_filename": "Kottayam-Plan.pdf",
+        "title": "Hospital Disaster Management Plan for Kottayam",
+        "category": "Hospital Plan",
+        "jurisdiction": "Kerala (District)",
+        "pages": "N/A",
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "hospital-plan",
+            "kerala (district)"
+        ]
+    },
+    {
+        "original_filename": "general-hospital-kozhikode",
+        "mapped_filename": "Kozhikode-Plan.pdf",
+        "title": "Hospital Disaster Management Plan for Kozhikode",
+        "category": "Hospital Plan",
+        "jurisdiction": "Kerala (District)",
+        "pages": "N/A",
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "hospital-plan",
+            "kerala (district)"
+        ]
+    },
+    {
+        "original_filename": "general-hospital-malappuram",
+        "mapped_filename": "Malappuram-Plan.pdf",
+        "title": "Hospital Disaster Management Plan for Malappuram",
+        "category": "Hospital Plan",
+        "jurisdiction": "Kerala (District)",
+        "pages": "N/A",
+        "language": "Malayalam",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "hospital-plan",
+            "kerala (district)"
+        ]
+    },
+    {
+        "original_filename": "general-hospital-palakkad",
+        "mapped_filename": "Palakkad-Plan.pdf",
+        "title": "Hospital Disaster Management Plan for Palakkad",
+        "category": "Hospital Plan",
+        "jurisdiction": "Kerala (District)",
+        "pages": "N/A",
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "hospital-plan",
+            "kerala (district)"
+        ]
+    },
+    {
+        "original_filename": "general-hospital-pathanamthitta",
+        "mapped_filename": "Pathanamthitta-Plan.pdf",
+        "title": "Hospital Disaster Management Plan for Pathanamthitta",
+        "category": "Hospital Plan",
+        "jurisdiction": "Kerala (District)",
+        "pages": "N/A",
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "hospital-plan",
+            "kerala (district)"
+        ]
+    },
+    {
+        "original_filename": "general-hospital-thrissur",
+        "mapped_filename": "Thrissur-Plan.pdf",
+        "title": "Hospital Disaster Management Plan for Thrissur",
+        "category": "Hospital Plan",
+        "jurisdiction": "Kerala (District)",
+        "pages": "N/A",
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "hospital-plan",
+            "kerala (district)"
+        ]
+    },
+    {
+        "original_filename": "general-hospital-tvm",
+        "mapped_filename": "Thiruvananthapuram-Plan-2.pdf",
+        "title": "Hospital Disaster Management Plan for Thiruvananthapuram (TVM)",
+        "category": "Hospital Plan",
+        "jurisdiction": "Kerala (District)",
+        "pages": "N/A",
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "hospital-plan",
+            "kerala (district)"
+        ]
+    },
+    {
+        "original_filename": "general-hospital-wayanad",
+        "mapped_filename": "Wayanad-Plan.pdf",
+        "title": "Hospital Disaster Management Plan for Wayanad",
+        "category": "Hospital Plan",
+        "jurisdiction": "Kerala (District)",
+        "pages": "N/A",
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "hospital-plan",
+            "kerala (district)"
+        ]
+    },
+    {
+        "original_filename": "national-disaster-management-plan",
+        "mapped_filename": "National-Disaster-Management-Plan-2019.pdf",
+        "title": "National Disaster Management Plan (NDMP) 2019",
+        "category": "Plan",
+        "jurisdiction": "National",
+        "pages": "N/A",
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "plan",
+            "national"
+        ]
+    },
+    {
+        "original_filename": "Orange-Book-of-Disaster-Management-1-2019",
+        "mapped_filename": "Orange-Book-2019.pdf",
+        "title": "Standard Operating Procedures for Disaster Management (Orange Book 2019)",
+        "category": "SOP",
+        "jurisdiction": "Kerala",
+        "pages": 84,
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "sop",
+            "kerala"
+        ]
+    },
+    {
+        "original_filename": "Orange-Book-of-Disaster-Management-2025mal",
+        "mapped_filename": "Orange-Book-2025.pdf",
+        "title": "Standard Operating Procedures for Disaster Management (Orange Book 2025)",
+        "category": "SOP",
+        "jurisdiction": "Kerala",
+        "pages": 327,
+        "language": "Malayalam",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "sop",
+            "kerala"
+        ]
+    },
+    {
+        "original_filename": "The Disaster Management Act, 2005",
+        "mapped_filename": "Disaster-Management-Act-2005.pdf",
+        "title": "The Disaster Management Act, 2005 (Primary Legislation)",
+        "category": "Act",
+        "jurisdiction": "National",
+        "pages": 29,
+        "language": "English",
+        "tags": [
+            "flood",
+            "disaster-management",
+            "act",
+            "national"
+        ]
+    }
+]

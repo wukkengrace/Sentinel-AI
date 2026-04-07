@@ -20,7 +20,7 @@ CHUNK_SIZE  = 500    # characters per chunk (tune based on your PDF density)
 CHUNK_OVERLAP = 80
 
 # ── Metadata from metadata.txt ────────────────────────────────────────────────
-RAW_METADATA = [
+DEFAULT_METADATA = [
     {
         "mapped_filename": "Disaster-Bill-2024.pdf",
         "title": "Disaster Management (Amendment) Bill, 2024",
@@ -36,49 +36,33 @@ RAW_METADATA = [
         "tags": ["flood","disaster-management","hospital-plan","thiruvananthapuram"]
     },
     {
-        "mapped_filename": "English-E-version-DRR.pdf",
-        "title": "English Version of Disaster Risk Reduction Report",
-        "category": "Report",
-        "jurisdiction": "Kerala",
-        "tags": ["flood","disaster-management","report","kerala"]
-    },
-    {
-        "mapped_filename": "Orange-Book-2019.pdf",
-        "title": "Standard Operating Procedures for Disaster Management (Orange Book 2019)",
-        "category": "SOP",
-        "jurisdiction": "Kerala",
-        "tags": ["flood","disaster-management","sop","kerala"]
-    },
-    {
         "mapped_filename": "Orange-Book-2025.pdf",
         "title": "Standard Operating Procedures for Disaster Management (Orange Book 2025)",
         "category": "SOP",
         "jurisdiction": "Kerala",
         "tags": ["flood","disaster-management","sop","kerala"]
     },
-    {
-        "mapped_filename": "Disaster-Management-Act-2005.pdf",
-        "title": "The Disaster Management Act, 2005 (Primary Legislation)",
-        "category": "Act",
-        "jurisdiction": "National",
-        "tags": ["flood","disaster-management","act","national"]
-    },
-    {
-        "mapped_filename": "National-Disaster-Management-Plan-2019.pdf",
-        "title": "National Disaster Management Plan (NDMP) 2019",
-        "category": "Plan",
-        "jurisdiction": "National",
-        "tags": ["flood","disaster-management","plan","national"]
-    },
-    {
-        "mapped_filename": "Thiruvananthapuram-Plan-2.pdf",
-        "title": "Hospital Disaster Management Plan for Thiruvananthapuram (TVM)",
-        "category": "Hospital Plan",
-        "jurisdiction": "Kerala (District)",
-        "tags": ["flood","disaster-management","hospital-plan","thiruvananthapuram"]
-    },
 ]
 
+def load_metadata():
+    """Attempt to load metadata from data/metadata.txt, which should be valid JSON array."""
+    txt_path = os.path.join(os.path.dirname(__file__), "data", "metadata.txt")
+    if not os.path.exists(txt_path):
+        print(f"[WARN] {txt_path} not found. Using default mock metadata.")
+        return DEFAULT_METADATA
+    
+    try:
+        with open(txt_path, "r", encoding="utf-8") as f:
+            content = f.read()
+            data = json.loads(content)
+            print(f"[INFO] Loaded {len(data)} document definitions from metadata.txt.")
+            return data
+    except Exception as e:
+        print(f"[ERROR] Failed to parse metadata.txt as JSON: {e}")
+        print("[WARN] Using default mock metadata instead.")
+        return DEFAULT_METADATA
+
+RAW_METADATA = load_metadata()
 
 def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
     """Split text into overlapping chunks."""

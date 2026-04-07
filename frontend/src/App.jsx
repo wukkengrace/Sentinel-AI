@@ -147,24 +147,34 @@ function LeafletMap({ incidents, resources, rescueUnits }) {
   );
 }
 
-function ThoughtTrace({ incidentId, events }) {
+function ThoughtTrace({ incidentId, events, autoStart }) {
   const [lines, setLines] = useState([]);
   const [active, setActive] = useState(false);
   const termRef = useRef(null);
+  const esRef = useRef(null);
 
   const startStream = useCallback(() => {
     if (!incidentId) return;
+    if (esRef.current) { esRef.current.close(); }
     setLines([]);
     setActive(true);
     const es = new EventSource(`${API}/stream/${incidentId}`);
+    esRef.current = es;
     es.onmessage = (e) => {
       const data = JSON.parse(e.data);
       setLines(prev => [...prev, data.message]);
-      if (data.message === "[STREAM_END]") { es.close(); setActive(false); }
+      if (data.message === "[STREAM_END]") { es.close(); esRef.current = null; setActive(false); }
     };
-    es.onerror = () => { es.close(); setActive(false); };
-    return () => es.close();
+    es.onerror = () => { es.close(); esRef.current = null; setActive(false); };
   }, [incidentId]);
+
+  // Auto-start stream when incidentId changes and autoStart is requested
+  useEffect(() => {
+    if (autoStart && incidentId) {
+      startStream();
+    }
+    return () => { if (esRef.current) { esRef.current.close(); esRef.current = null; } };
+  }, [autoStart, incidentId]);
 
   useEffect(() => {
     if (termRef.current) termRef.current.scrollTop = termRef.current.scrollHeight;
@@ -261,6 +271,8 @@ export default function SentinelDashboard() {
       }
   }, [tab, streamId]);
 
+  const [autoStartStream, setAutoStartStream] = useState(false);
+
   const handleDispatch = async () => {
     if (totalVictims === 0) {
         alert("Total victims must be greater than 0");
@@ -276,19 +288,26 @@ export default function SentinelDashboard() {
       extra_comments: extraComments
     };
     
-    alert("Dispatching incident...");
     const res = await apiFetch("/incident", { method: "POST", body: JSON.stringify(payload) });
     
     if (res.error) {
       if (res.data?.detail?.status === "FRAUD_ALERT") {
           alert(`🚫 FRAUD ALERT: ${res.data.detail.message}`);
       } else {
-          alert(`Error dispatching incident.`);
+          alert(`Error: ${JSON.stringify(res.data?.detail || res.message || "Unknown error")}`);
       }
     } else {
-      setStreamId(res.data.incident_id);
+      const newId = res.data.incident_id;
+      setStreamId(newId);
+      setAutoStartStream(true);
       setTab("trace");
-      refreshData();
+      // Rapid-poll for 10 seconds so the new incident appears immediately
+      let count = 0;
+      const rapidPoll = setInterval(() => {
+        refreshData();
+        count++;
+        if (count >= 20) clearInterval(rapidPoll);
+      }, 500);
     }
   };
 
@@ -584,7 +603,7 @@ export default function SentinelDashboard() {
                  </div>
               </div>
               <div className="flex-1 min-h-0">
-                <ThoughtTrace incidentId={streamId} events={events} />
+                <ThoughtTrace incidentId={streamId} events={events} autoStart={autoStartStream} />
               </div>
              </div>
           </div>

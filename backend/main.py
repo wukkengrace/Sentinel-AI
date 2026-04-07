@@ -383,7 +383,7 @@ def create_incident(data: IncidentIn, background_tasks: BackgroundTasks):
          is_lgbtq, is_disability, fire_hzd, power_hzd,
          emergency_type, flood_level, vip_flagged, extra_comments,
          lat, lon, status)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Pending')
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Pending')
     """, (
         data.phone, data.victim_name, data.aadhar_id,
         data.male_cnt, data.female_cnt, data.child_cnt, total_victims,
@@ -446,7 +446,7 @@ async def stream_thought_trace(incident_id: int):
             msgs = sse_queues.get(incident_id, [])
             while sent < len(msgs):
                 msg = msgs[sent]
-                yield f"data: {json.dumps({'message': msg, 'ts': datetime.utcnow().isoformat()})}\\n\\n"
+                yield f"data: {json.dumps({'message': msg, 'ts': datetime.utcnow().isoformat()})}\n\n"
                 sent += 1
 
             if sent > 0 and msgs and msgs[-1].startswith("[DONE]"):
@@ -455,7 +455,7 @@ async def stream_thought_trace(incident_id: int):
             await asyncio.sleep(0.5)
             elapsed += 0.5
 
-        yield f"data: {json.dumps({'message': '[STREAM_END]', 'ts': datetime.utcnow().isoformat()})}\\n\\n"
+        yield f"data: {json.dumps({'message': '[STREAM_END]', 'ts': datetime.utcnow().isoformat()})}\n\n"
 
     return StreamingResponse(
         event_generator(),

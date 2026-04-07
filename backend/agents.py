@@ -98,6 +98,59 @@ def _get_available_unit(unit_type: str, incident_lat: float, incident_lon: float
     return best
 
 
+def _get_deployed_unit(unit_type: str, incident_lat: float, incident_lon: float) -> dict | None:
+    """Return the nearest DEPLOYED unit for override reassignment."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM rescue_units WHERE unit_type=? AND status='Deployed'", (unit_type,)
+    ).fetchall()
+    conn.close()
+    units = [dict(r) for r in rows]
+    if not units:
+        return None
+    def dist(u):
+        dlat = math.radians(u["base_lat"] - incident_lat)
+        dlon = math.radians(u["base_lon"] - incident_lon)
+        a = math.sin(dlat/2)**2 + math.cos(math.radians(incident_lat)) * math.cos(math.radians(u["base_lat"])) * math.sin(dlon/2)**2
+        return 6371 * 2 * math.asin(math.sqrt(a))
+    units.sort(key=dist)
+    best = units[0]
+    best["distance_km"] = dist(best)
+    return best
+
+
+def _get_active_mission_contexts() -> list:
+    """
+    Return score/progress context dicts for all currently dispatched missions.
+    Used by evaluate_multi_override to compute aggregate residual cost.
+    """
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT i.*,
+               a.eta_minutes,
+               a.distance_km,
+               (CAST((julianday('now') - julianday(a.dispatched_at)) * 24 * 60 AS REAL)) AS elapsed_min
+        FROM incidents i
+        JOIN rescue_unit_assignments a ON a.incident_id = i.id
+        WHERE i.status = 'Dispatched' AND a.status = 'Dispatched'
+    """).fetchall()
+    conn.close()
+
+    missions = []
+    for r in [dict(row) for row in rows]:
+        elapsed  = r.get("elapsed_min") or 0.0
+        eta      = r.get("eta_minutes") or 1.0
+        progress = min(1.0, elapsed / max(eta, 1.0))
+        score, raw_score = priority_engine.score_incident(r)
+        missions.append({
+            "score":      score,
+            "raw_score":  raw_score,
+            "progress":   progress,
+            "distance_m": (r.get("distance_km") or 5.0) * 1000,
+        })
+    return missions
+
+
 def _assign_rescue_unit(incident_id: int, unit: dict, eta_min: float) -> int:
     """Assign unit to incident, return assignment ID."""
     conn = get_connection()
@@ -455,6 +508,28 @@ def run_crew_and_dispatch(incident: Dict[str, Any], push_sse) -> str:
     score, raw_score = priority_engine.score_incident(incident)
     push_sse(f"[Priority Engine] Score={score} (raw={raw_score}), Priority={incident.get('priority','Standard')}")
 
+    # ── Override Check against Active Missions ─────────────────────────────
+    active_missions = _get_active_mission_contexts()
+    if active_missions:
+        inc_input = {
+            "hazard":     emergency_type,
+            "medical":    [incident.get("severity", "low")] * max(1, incident.get("medical_cnt", 1)),
+            "vulnerable": (
+                "high_risk"
+                if incident.get("is_lgbtq") or incident.get("is_disability") or incident.get("child_cnt", 0) > 0
+                else "standard"
+            ),
+            "env": "camp" if flood_level > 0 else "home",
+        }
+        override_result = priority_engine.evaluate_multi_override(inc_input, active_missions)
+        push_sse(
+            f"[Priority Engine] Override check: S_new={override_result['s_new']} vs "
+            f"\u03a3_cost={override_result['total_residual_cost']} \u2192 "
+            f"{'OVERRIDE APPROVED \u2713' if override_result['override_approved'] else 'HOLD \u2014 insufficient priority \u2717'}"
+        )
+    else:
+        override_result = {"override_approved": True}  # no active missions → always dispatch
+
     # ── Audit Log ──────────────────────────────────────────────────────────
     _write_audit(iid, "Strategy Lead", "APPROVED",
                  f"Severity-based triage approved. Priority Score: {score}. DM Act 2005 compliant.",
@@ -484,6 +559,29 @@ def run_crew_and_dispatch(incident: Dict[str, Any], push_sse) -> str:
     resource_id = None
     if unit_type:
         unit = _get_available_unit(unit_type, incident["lat"], incident["lon"])
+
+        # No available unit — attempt override reassignment if approved
+        if not unit:
+            if override_result.get("override_approved"):
+                unit = _get_deployed_unit(unit_type, incident["lat"], incident["lon"])
+                if unit:
+                    push_sse(
+                        f"[Override] Priority override approved — reassigning "
+                        f"{unit['name']} from active mission #{unit.get('current_incident_id', '?')}."
+                    )
+                    _log_dispatch_event(
+                        iid, "OVERRIDE",
+                        f"Unit {unit['name']} reassigned via priority override (Score={score}).",
+                        unit["id"]
+                    )
+                else:
+                    push_sse(f"[WARNING] Override approved but no {unit_type} unit found (deployed or available). Requesting mutual aid.")
+            else:
+                push_sse(
+                    f"[WARNING] No {unit_type} unit available and override NOT approved "
+                    f"(S_new={score} ≤ Σ_cost={override_result.get('total_residual_cost', '?')}). Queuing incident."
+                )
+
         if unit:
             eta = _compute_eta(unit["distance_km"], flood_level)
             assignment_id = _assign_rescue_unit(iid, unit, eta)
@@ -491,7 +589,7 @@ def run_crew_and_dispatch(incident: Dict[str, Any], push_sse) -> str:
             _log_dispatch_event(iid, "DISPATCHED",
                                 f"{unit['name']} dispatched — ETA {eta} min ({unit['distance_km']:.1f} km).",
                                 unit["id"])
-            push_sse(f"[Dispatch] {unit['name']} ({unit['boat_type']}) dispatched → ETA {eta:.1f} min")
+            push_sse(f"[Dispatch] {unit['name']} ({unit['boat_type']}) dispatched \u2192 ETA {eta:.1f} min")
 
             # Find nearest resource for victim placement
             resources    = _fetch_resources()
@@ -504,12 +602,10 @@ def run_crew_and_dispatch(incident: Dict[str, Any], push_sse) -> str:
             )
             if nearest:
                 resource_id = nearest["id"]
-                push_sse(f"[Placement] Victims → {nearest['name']} ({nearest['distance_km']:.1f} km)")
+                push_sse(f"[Placement] Victims \u2192 {nearest['name']} ({nearest['distance_km']:.1f} km)")
 
             # Schedule auto-complete simulation
             _schedule_rescue_complete(assignment_id, unit["id"], iid, eta, resource_id, push_sse)
-        else:
-            push_sse(f"[WARNING] No {unit_type} unit available. Requesting mutual aid.")
     else:
         push_sse(f"[Liaison] {emergency_type} incident — agency notified, no rescue unit required.")
         # For non-flood non-rescue types, still find resource

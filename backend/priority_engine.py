@@ -171,9 +171,12 @@ class PriorityOverrideSystem:
             if incident.get("is_lgbtq") or incident.get("is_disability") or incident.get("child_cnt", 0) > 0
             else "standard"
         )
-        # Use shelter presence as environment proxy: shelter_cnt > 0 → camp
-        env = "camp" if incident.get("shelter_cnt", 0) > 0 else "home"
-        medical_tags = [severity] * max(1, incident.get("medical_cnt", 1))
+        # Use flood_level as environment proxy: flood → displaced camp, else home
+        # (shelter_cnt counts people needing shelter, NOT whether they are at a camp)
+        env = "camp" if incident.get("flood_level", 0) > 0 else "home"
+        # medical_cnt=0 → no medical weight; max(0,...) prevents spurious single-tag
+        medical_cnt = max(0, incident.get("medical_cnt", 0))
+        medical_tags = [severity] * medical_cnt if medical_cnt > 0 else []
         return self.calculate_priority_score(hazard, medical_tags, is_vulnerable, env)
 
 

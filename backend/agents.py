@@ -7,6 +7,15 @@ agents.py — Sentinel-AI v2.0 Multi-Agent Crew (CrewAI + Ollama)
   Local Liaison   → llama3.1:8b      (instruction-following, agency/hazard mapping)
   Operations      → llama3.2:3b      (efficient, ETA math + dispatch summary)
 
+v2.0 Changes:
+  - 10-minute admission simulation (configurable via ADMISSION_DELAY_SECONDS)
+  - Fleet-specific override gate (only activates when specific fleet is 100% occupied)
+  - External shelter fallback (search beyond local zone when capacity = 0)
+  - Multi-agent consensus scoring (20% weight)
+  - DM Act 2005 Sections 30 & 34 citations in audit trail
+  - Aadhaar ID logged in audit entries
+  - Sewage → Fishermen dispatch default
+
 DB writes and resource allocation happen in Python wrappers, not LLM tool-calls.
 """
 
@@ -17,6 +26,7 @@ import datetime
 import math
 import asyncio
 import threading
+import time
 from typing import Any, Dict, List
 
 from crewai import Agent, Task, Crew, Process
@@ -25,7 +35,10 @@ from crewai import LLM
 from database import get_connection
 from haversine import nearest_resource, rank_resources
 from ingest_kb import query_kb
-from priority_engine import engine as priority_engine
+from priority_engine import engine as priority_engine, DM_ACT_CITATIONS
+
+# ── Configurable Admission Delay ──────────────────────────────────────────────
+ADMISSION_DELAY_SECONDS = int(os.getenv("ADMISSION_DELAY_SECONDS", "600"))
 
 
 # ── LLM Factories ─────────────────────────────────────────────────────────────
@@ -56,11 +69,15 @@ def _fetch_resources() -> list:
     return [dict(r) for r in rows]
 
 
-def _write_audit(incident_id: int, agent: str, decision: str, reasoning: str, citation: str = ""):
+def _write_audit(incident_id: int, agent: str, decision: str, reasoning: str,
+                 citation: str = "", aadhar_id: str = None, fleet_check: str = None,
+                 consensus_score: float = None):
     conn = get_connection()
     conn.execute(
-        "INSERT INTO audit_logs (incident_id, agent, decision, reasoning, citation) VALUES (?,?,?,?,?)",
-        (incident_id, agent, decision, reasoning, citation)
+        """INSERT INTO audit_logs (incident_id, aadhar_id, agent, decision, reasoning,
+                                   citation, fleet_check, consensus_score)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (incident_id, aadhar_id, agent, decision, reasoning, citation, fleet_check, consensus_score)
     )
     conn.commit()
     conn.close()
@@ -86,7 +103,6 @@ def _get_available_unit(unit_type: str, incident_lat: float, incident_lon: float
     units = [dict(r) for r in rows]
     if not units:
         return None
-    # Sort by haversine distance from incident
     def dist(u):
         dlat = math.radians(u["base_lat"] - incident_lat)
         dlon = math.radians(u["base_lon"] - incident_lon)
@@ -117,6 +133,19 @@ def _get_deployed_unit(unit_type: str, incident_lat: float, incident_lon: float)
     best = units[0]
     best["distance_km"] = dist(best)
     return best
+
+
+def _get_fleet_status() -> dict:
+    """Get availability counts for each fleet type (for fleet-specific gate check)."""
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT unit_type,
+               COUNT(*) as total,
+               SUM(CASE WHEN status='Available' THEN 1 ELSE 0 END) as available
+        FROM rescue_units GROUP BY unit_type
+    """).fetchall()
+    conn.close()
+    return {dict(r)["unit_type"]: {"total": dict(r)["total"], "available": dict(r)["available"]} for r in rows}
 
 
 def _get_active_mission_contexts() -> list:
@@ -173,29 +202,75 @@ def _assign_rescue_unit(incident_id: int, unit: dict, eta_min: float) -> int:
     return assignment_id
 
 
-def _place_victims(incident_id: int, resource_id: int):
-    """Mark all victims of an incident as placed at a resource."""
+def _place_victims_in_transit(incident_id: int):
+    """Mark all victims of an incident as In_Transit (before admission simulation)."""
     conn = get_connection()
     conn.execute(
-        """UPDATE victims SET status='Admitted', assigned_resource_id=?, placed_at=CURRENT_TIMESTAMP
-           WHERE incident_id=? AND needs_medical=1""",
-        (resource_id, incident_id)
-    )
-    conn.execute(
-        """UPDATE victims SET status='Sheltered', assigned_resource_id=?, placed_at=CURRENT_TIMESTAMP
-           WHERE incident_id=? AND needs_medical=0""",
-        (resource_id, incident_id)
+        "UPDATE victims SET status='In_Transit' WHERE incident_id=? AND status='Reported'",
+        (incident_id,)
     )
     conn.commit()
     conn.close()
 
 
+def _complete_admission(incident_id: int, resource_id: int, push_sse):
+    """
+    Simulate hospital/shelter check-in with configurable delay.
+    Resource capacity is ONLY decremented AFTER the delay completes.
+    """
+    _log_dispatch_event(incident_id, "ADMISSION_START",
+                        f"Admission simulation started ({ADMISSION_DELAY_SECONDS}s delay). Victims In-Transit.")
+    push_sse(f"[Admission] 🏥 Check-in simulation started — {ADMISSION_DELAY_SECONDS}s delay...")
+
+    # The 10-minute mock sleep (configurable)
+    time.sleep(ADMISSION_DELAY_SECONDS)
+
+    conn = get_connection()
+    if resource_id:
+        # Medical victims → Admitted at Hospital
+        conn.execute(
+            """UPDATE victims SET status='Admitted', assigned_resource_id=?, placed_at=CURRENT_TIMESTAMP
+               WHERE incident_id=? AND needs_medical=1 AND status='In_Transit'""",
+            (resource_id, incident_id)
+        )
+        # Non-medical victims → Sheltered
+        conn.execute(
+            """UPDATE victims SET status='Sheltered', assigned_resource_id=?, placed_at=CURRENT_TIMESTAMP
+               WHERE incident_id=? AND needs_medical=0 AND status='In_Transit'""",
+            (resource_id, incident_id)
+        )
+        # NOW decrement resource capacity (only after admission complete)
+        victim_count = conn.execute(
+            "SELECT COUNT(*) FROM victims WHERE incident_id=? AND assigned_resource_id=?",
+            (incident_id, resource_id)
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE resources SET cap_avail = MAX(0, cap_avail - ?) WHERE id=?",
+            (victim_count, resource_id)
+        )
+        # Check if resource is now full
+        resource = conn.execute("SELECT cap_avail FROM resources WHERE id=?", (resource_id,)).fetchone()
+        if resource and dict(resource)["cap_avail"] <= 0:
+            conn.execute("UPDATE resources SET status='Full' WHERE id=?", (resource_id,))
+    conn.commit()
+    conn.close()
+
+    _log_dispatch_event(incident_id, "ADMISSION_COMPLETE",
+                        f"Admission complete. Resource #{resource_id} capacity decremented.")
+    push_sse(f"[Admission Complete] ✅ Victims admitted — resource capacity updated.")
+
+
 def _schedule_rescue_complete(assignment_id: int, unit_id: int, incident_id: int,
                                eta_min: float, resource_id: int, push_sse):
-    """Auto-simulate rescue complete after ETA elapses (background thread)."""
+    """
+    v2.0: Auto-simulate rescue complete after ETA, then run 10-minute admission.
+    Fleet unit returns to Available INSTANTLY after victim pickup.
+    Resource capacity decrements ONLY after admission delay.
+    """
     def _complete():
-        import time
-        time.sleep(eta_min * 60)  # wait ETA in real seconds for demo — fine for simulation
+        time.sleep(2)  # fast simulation wait for rescue to complete
+
+        # ── Step 1: Rescue complete — pick up victims ─────────────────────
         conn = get_connection()
         conn.execute(
             """UPDATE rescue_unit_assignments
@@ -209,15 +284,15 @@ def _schedule_rescue_complete(assignment_id: int, unit_id: int, incident_id: int
         conn.commit()
         conn.close()
 
-        _place_victims(incident_id, resource_id)
+        # Set victims to In-Transit
+        _place_victims_in_transit(incident_id)
+
         _log_dispatch_event(incident_id, "RESCUE_COMPLETE",
                             f"Rescue unit #{unit_id} confirmed victim pickup.", unit_id)
-        _log_dispatch_event(incident_id, "VICTIM_PLACED",
-                            f"Victims placed at resource #{resource_id}.", unit_id)
-        push_sse(f"[Rescue Complete] Unit #{unit_id} confirmed pickup — victims placed.")
+        push_sse(f"[Rescue Complete] Unit #{unit_id} confirmed pickup — victims now In-Transit.")
 
-        # Mark unit as returning, then available after 10 min
-        time.sleep(600)
+        # ── Step 2: Fleet unit returns IMMEDIATELY (no admission wait) ────
+        time.sleep(1)
         conn = get_connection()
         conn.execute(
             """UPDATE rescue_unit_assignments SET status='Returned', returned_at=CURRENT_TIMESTAMP WHERE id=?""",
@@ -228,14 +303,22 @@ def _schedule_rescue_complete(assignment_id: int, unit_id: int, incident_id: int
                sorties_completed=sorties_completed+1 WHERE id=?""",
             (unit_id,)
         )
+        conn.commit()
+        conn.close()
+        _log_dispatch_event(incident_id, "UNIT_RETURNED",
+                            f"Unit #{unit_id} returned to base — Available for next mission.", unit_id)
+        push_sse(f"[Unit Returned] Unit #{unit_id} back at base — Available for next mission.")
+
+        # ── Step 3: Start admission simulation (10-minute delay) ──────────
+        _complete_admission(incident_id, resource_id, push_sse)
+
+        # Mark incident as resolved after admission
+        conn = get_connection()
         conn.execute(
             "UPDATE incidents SET status='Resolved' WHERE id=?", (incident_id,)
         )
         conn.commit()
         conn.close()
-        _log_dispatch_event(incident_id, "UNIT_RETURNED",
-                            f"Unit #{unit_id} returned to base and is now Available.", unit_id)
-        push_sse(f"[Unit Returned] Unit #{unit_id} back at base — Available for next mission.")
 
     t = threading.Thread(target=_complete, daemon=True)
     t.start()
@@ -251,23 +334,54 @@ def _get_agencies(category: str) -> list:
     return [dict(r) for r in rows]
 
 
+def _find_external_resource(lat: float, lon: float, resource_type: str, push_sse) -> dict | None:
+    """
+    External Shelter Fallback: When all local resources are full,
+    search for the nearest available facility without strict type filter.
+    """
+    resources = _fetch_resources()
+
+    # Try same type first (even if status is 'Full', look for any with remaining cap)
+    for r in resources:
+        if r.get("type") == resource_type and r.get("cap_avail", 0) > 0:
+            return r
+
+    # Fallback: any resource with capacity
+    available = [r for r in resources if r.get("cap_avail", 0) > 0]
+    if available:
+        # Sort by distance
+        def dist(r):
+            dlat = math.radians(r["lat"] - lat)
+            dlon = math.radians(r["lon"] - lon)
+            a = math.sin(dlat/2)**2 + math.cos(math.radians(lat)) * math.cos(math.radians(r["lat"])) * math.sin(dlon/2)**2
+            return 6371 * 2 * math.asin(math.sqrt(a))
+        available.sort(key=dist)
+        fallback = available[0]
+        push_sse(f"[Shelter Fallback] ⚠️ Local {resource_type} capacity exhausted. Routing to {fallback['name']} ({fallback['type']}).")
+        return fallback
+
+    push_sse(f"[CRITICAL] ❌ ALL resources at zero capacity. Manual intervention required.")
+    return None
+
+
 # ── Flood Level → Unit Type Routing ──────────────────────────────────────────
 
 FLOOD_UNIT_MAP = {
     0: None,               # no flood
-    1: "Fire_Rescue",      # Water < 3ft — Fire & Rescue Dinghy
-    2: "Fishermen",        # Rapid Urban Inundation — Fishermen boats
-    3: "NDRF",             # Deep Water / High Velocity — NDRF OBM
-    4: "IAF_Navy",         # Total Isolation — Helicopter Airlift
-    5: "IAF_Navy",         # Bridge/Road Collapse — Helicopter + Army
+    1: "Fire_Rescue",      # Level 1: Ankle — Fire & Rescue Dinghy
+    2: "Fishermen",        # Level 2: Waist — Fishermen boats
+    3: "NDRF",             # Level 3: Overhead — NDRF OBM
+    4: "IAF_Navy",         # Total Isolation — Helicopter Airlift (internal)
+    5: "IAF_Navy",         # Bridge/Road Collapse — Helicopter + Army (internal)
 }
 
 EMERGENCY_UNIT_MAP = {
     "Fire":       "Fire_Rescue",
-    "Electrical": None,     # KSEB notification, no rescue unit needed
-    "Sewage":     None,     # KWA notification only
+    "Electrical": None,          # KSEB notification, no rescue unit needed
+    "Sewage":     "Fishermen",   # v2.0: Default to fishermen for sewage/water rescue
     "Road":       "Army",
     "Tree":       "Fire_Rescue",
+    "Flood":      "Fishermen",   # Default flood → fishermen
     "Other":      "Fire_Rescue",
 }
 
@@ -353,13 +467,16 @@ def build_crew(incident: Dict[str, Any], step_callback=None) -> Crew:
     strategy_lead = Agent(
         role="Strategy Lead & Legal Auditor",
         goal=(
-            "Audit the dispatch decision against DM Act 2005. "
-            "Think step-by-step. Output APPROVED or REJECTED with legal citation."
+            "Audit the dispatch decision against DM Act 2005 (Sections 30, 34, 38). "
+            "Think step-by-step. Output APPROVED or REJECTED with legal citation. "
+            "Also provide a consensus priority score (0-150) based on your assessment."
         ),
         backstory=(
             "You are the incorruptible legal guardian of Sentinel-AI. "
             "You know the Disaster Management Act 2005 and Kerala Orange Book by heart. "
-            "You check priority scores, VIP flags, and fraud alerts before approving any dispatch."
+            "You check priority scores, VIP flags, and fraud alerts before approving any dispatch. "
+            "You always cite DM Act 2005 Section 30 (State Authority override powers) and "
+            "Section 34 (District Authority duties) in your reasoning."
         ),
         llm=_llm_strategy(),
         tools=[], max_iter=3, step_callback=step_callback, verbose=True,
@@ -370,11 +487,14 @@ def build_crew(incident: Dict[str, Any], step_callback=None) -> Crew:
         role="Local Liaison Officer",
         goal=(
             "Identify which TVM agencies must be notified. "
+            "Route LGBTQIA+ victims to safe-space shelters (no priority change). "
             "Output a JSON list with agency names and their WhatsApp numbers."
         ),
         backstory=(
             "You know every government department in Thiruvananthapuram — "
             "Fire & Rescue, KSEB, KWA, PWD, Police, DHS, Forest. "
+            "You handle LGBTQIA+ shelter routing: their status earns ZERO priority points, "
+            "but you ensure they are directed to inclusive/safe-space shelters. "
             "You are precise with JSON formatting and always output structured data."
         ),
         llm=_llm_liaison(),
@@ -413,13 +533,14 @@ INCIDENT:
         description=f"""
 You are the legal auditor. Based on the situation report:
 1. State APPROVED or REJECTED under DM Act 2005.
-2. Cite the specific section (e.g. Section 38(2)).
+2. Cite the specific section (Section 30 for state override, Section 34 for district duties).
 3. Confirm no VIP override is influencing this decision.
 4. Note if ULTRA_PRIORITY is triggered (total_victims={total_victims}, priority={priority}).
+5. Provide your consensus priority score (0-150) as a single integer on the last line, prefixed with CONSENSUS_SCORE:
 
 INCIDENT ID: {iid}
 """,
-        expected_output="APPROVED or REJECTED, legal citation, VIP status, 2-3 sentences reasoning.",
+        expected_output="APPROVED or REJECTED, legal citation (DM Act 2005 Sec 30/34), VIP status, consensus score.",
         agent=strategy_lead,
         context=[task_triage],
     )
@@ -434,7 +555,7 @@ Flood Level: {flood_level}
 Rules:
 - Fire → Fire & Rescue
 - Electrical → KSEB + Police
-- Sewage → KWA + Police
+- Sewage → KWA + Police + Fishermen dispatch
 - Road → PWD + Army + Police
 - Tree → Forest + Police
 - Flood Level 1-2 → Fire & Police
@@ -446,7 +567,6 @@ Output only a JSON array like: [{{"agency": "Fire HQ", "whatsapp": "..."}}]
 """,
         expected_output="JSON array of agencies to notify.",
         agent=local_liaison,
-        async_execution=True,
     )
 
     task_dispatch = Task(
@@ -486,57 +606,106 @@ INCIDENT: lat={incident.get('lat')}, lon={incident.get('lon')}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# CONSENSUS SCORE EXTRACTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _extract_consensus_score(crew_output: str) -> float:
+    """
+    Parse the crew output for a CONSENSUS_SCORE line from the Strategy Lead.
+    Returns the score or a fallback based on APPROVED/REJECTED status.
+    """
+    try:
+        for line in str(crew_output).split("\n"):
+            if "CONSENSUS_SCORE:" in line.upper():
+                score_str = line.split(":")[-1].strip()
+                return min(150.0, max(0.0, float(score_str)))
+    except (ValueError, IndexError):
+        pass
+    # Fallback: if APPROVED is in output, give a moderate consensus score
+    output_text = str(crew_output).upper()
+    if "APPROVED" in output_text:
+        return 100.0
+    return 50.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # RUN CREW + DISPATCH
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_crew_and_dispatch(incident: Dict[str, Any], push_sse) -> str:
     """
     1. Run the CrewAI crew (4 agents reasoning in sequence)
-    2. Score incident via Priority Override Engine
-    3. Write audit log
-    4. Assign nearest available rescue unit
-    5. Schedule auto-rescue-complete simulation
+    2. Extract consensus score from Strategy Lead
+    3. Compute final score with 20% consensus weight
+    4. Fleet-specific override gate
+    5. Write audit log with Aadhaar + fleet check + DM Act citation
+    6. Assign nearest available rescue unit
+    7. Schedule rescue + admission simulation
     """
     iid            = incident["id"]
     flood_level    = int(incident.get("flood_level", 0))
     emergency_type = incident.get("emergency_type", "Other")
+    aadhar_id      = incident.get("aadhar_id")
 
     crew   = build_crew(incident, step_callback=None)
     result = crew.kickoff()
 
-    # ── Priority Score ─────────────────────────────────────────────────────
-    score, raw_score = priority_engine.score_incident(incident)
-    push_sse(f"[Priority Engine] Score={score} (raw={raw_score}), Priority={incident.get('priority','Standard')}")
+    # ── Priority Score with Multi-Agent Consensus ──────────────────────────
+    base_score, raw_score = priority_engine.score_incident(incident)
+    consensus_score = _extract_consensus_score(str(result))
+    final_score = priority_engine.score_with_consensus(base_score, consensus_score)
+
+    push_sse(f"[Priority Engine] Base={base_score} (raw={raw_score}), Consensus={consensus_score}")
+    push_sse(f"[Priority Engine] Final Score={final_score} (80% base + 20% consensus)")
+    push_sse(f"[Priority Engine] Priority={incident.get('priority','Standard')}")
+
+    # ── Fleet-Specific Gate Check ──────────────────────────────────────────
+    if emergency_type == "Flood":
+        unit_type = FLOOD_UNIT_MAP.get(flood_level)
+    else:
+        unit_type = EMERGENCY_UNIT_MAP.get(emergency_type, "Fire_Rescue")
+
+    fleet_status = _get_fleet_status()
+    fleet_check_msg = None
+    if unit_type:
+        gate_result = priority_engine.check_fleet_gate(unit_type, fleet_status)
+        fleet_check_msg = gate_result["reason"]
+        push_sse(f"[Fleet Gate] {gate_result['reason']}")
 
     # ── Override Check against Active Missions ─────────────────────────────
-    active_missions = _get_active_mission_contexts()
-    if active_missions:
-        inc_input = {
-            "hazard":     emergency_type,
-            "medical":    [incident.get("severity", "low")] * max(1, incident.get("medical_cnt", 1)),
-            "vulnerable": (
-                "high_risk"
-                if incident.get("is_lgbtq") or incident.get("is_disability") or incident.get("child_cnt", 0) > 0
-                else "standard"
-            ),
-            "env": "camp" if flood_level > 0 else "home",
-        }
-        override_result = priority_engine.evaluate_multi_override(inc_input, active_missions)
-        push_sse(
-            f"[Priority Engine] Override check: S_new={override_result['s_new']} vs "
-            f"\u03a3_cost={override_result['total_residual_cost']} \u2192 "
-            f"{'OVERRIDE APPROVED \u2713' if override_result['override_approved'] else 'HOLD \u2014 insufficient priority \u2717'}"
-        )
-    else:
-        override_result = {"override_approved": True}  # no active missions → always dispatch
+    override_result = {"override_approved": True}  # default: always dispatch
+    if unit_type and fleet_status.get(unit_type, {}).get("available", 1) == 0:
+        # Only check override if specific fleet is 100% occupied
+        active_missions = _get_active_mission_contexts()
+        if active_missions:
+            inc_input = {
+                "hazard":     emergency_type,
+                "medical":    [incident.get("severity", "low")] * max(1, incident.get("medical_cnt", 1)),
+                "vulnerable": "disability" if incident.get("is_disability") else "standard",
+                "env": "camp" if flood_level > 0 else "home",
+            }
+            override_result = priority_engine.evaluate_multi_override(inc_input, active_missions)
+            fleet_check_msg = (fleet_check_msg or "") + f" | Override: S_new={override_result['s_new']} vs Σ_cost={override_result['total_residual_cost']}"
+            push_sse(
+                f"[Priority Engine] Override check: S_new={override_result['s_new']} vs "
+                f"Σ_cost={override_result['total_residual_cost']} → "
+                f"{'OVERRIDE APPROVED ✓' if override_result['override_approved'] else 'HOLD — insufficient priority ✗'}"
+            )
 
-    # ── Audit Log ──────────────────────────────────────────────────────────
-    _write_audit(iid, "Strategy Lead", "APPROVED",
-                 f"Severity-based triage approved. Priority Score: {score}. DM Act 2005 compliant.",
-                 "DM Act 2005, Section 38(2)")
+    # ── Audit Log with Aadhaar + Fleet Check + DM Act Citation ─────────────
+    citation = DM_ACT_CITATIONS["triage_approval"]
+    _write_audit(
+        iid, "Strategy Lead", "APPROVED",
+        f"Severity-based triage approved. Final Score: {final_score} (Base: {base_score}, Consensus: {consensus_score}). "
+        f"DM Act 2005 compliant. Priority: {incident.get('priority', 'Standard')}.",
+        citation=citation,
+        aadhar_id=aadhar_id,
+        fleet_check=fleet_check_msg,
+        consensus_score=consensus_score,
+    )
     _log_dispatch_event(iid, "TRIAGE_COMPLETE",
-                        f"Triage complete. Severity={incident.get('severity')}. Score={score}.")
-    push_sse("[Audit] Decision logged to transparency ledger.")
+                        f"Triage complete. Severity={incident.get('severity')}. Final Score={final_score}.")
+    push_sse(f"[Audit] Decision logged to transparency ledger. Legal basis: {citation}")
 
     # ── Agency Notifications ───────────────────────────────────────────────
     if emergency_type == "Flood":
@@ -551,11 +720,6 @@ def run_crew_and_dispatch(incident: Dict[str, Any], push_sse) -> str:
             push_sse(msg)
 
     # ── Rescue Unit Assignment ─────────────────────────────────────────────
-    if emergency_type == "Flood":
-        unit_type = FLOOD_UNIT_MAP.get(flood_level)
-    else:
-        unit_type = EMERGENCY_UNIT_MAP.get(emergency_type, "Fire_Rescue")
-
     resource_id = None
     if unit_type:
         unit = _get_available_unit(unit_type, incident["lat"], incident["lon"])
@@ -571,15 +735,23 @@ def run_crew_and_dispatch(incident: Dict[str, Any], push_sse) -> str:
                     )
                     _log_dispatch_event(
                         iid, "OVERRIDE",
-                        f"Unit {unit['name']} reassigned via priority override (Score={score}).",
+                        f"Unit {unit['name']} reassigned via priority override (Score={final_score}). "
+                        f"{fleet_check_msg}. Legal: {DM_ACT_CITATIONS['override']}",
                         unit["id"]
                     )
+                    _write_audit(
+                        iid, "Strategy Lead", "OVERRIDE",
+                        f"Fleet override executed: {unit['name']} reassigned. {fleet_check_msg}",
+                        citation=DM_ACT_CITATIONS["override"],
+                        aadhar_id=aadhar_id,
+                        fleet_check=fleet_check_msg,
+                    )
                 else:
-                    push_sse(f"[WARNING] Override approved but no {unit_type} unit found (deployed or available). Requesting mutual aid.")
+                    push_sse(f"[WARNING] Override approved but no {unit_type} unit found. Requesting mutual aid.")
             else:
                 push_sse(
                     f"[WARNING] No {unit_type} unit available and override NOT approved "
-                    f"(S_new={score} ≤ Σ_cost={override_result.get('total_residual_cost', '?')}). Queuing incident."
+                    f"(S_new={final_score} ≤ Σ_cost={override_result.get('total_residual_cost', '?')}). Queuing incident."
                 )
 
         if unit:
@@ -589,7 +761,7 @@ def run_crew_and_dispatch(incident: Dict[str, Any], push_sse) -> str:
             _log_dispatch_event(iid, "DISPATCHED",
                                 f"{unit['name']} dispatched — ETA {eta} min ({unit['distance_km']:.1f} km).",
                                 unit["id"])
-            push_sse(f"[Dispatch] {unit['name']} ({unit['boat_type']}) dispatched \u2192 ETA {eta:.1f} min")
+            push_sse(f"[Dispatch] {unit['name']} ({unit['boat_type']}) dispatched → ETA {eta:.1f} min")
 
             # Find nearest resource for victim placement
             resources    = _fetch_resources()
@@ -600,18 +772,35 @@ def run_crew_and_dispatch(incident: Dict[str, Any], push_sse) -> str:
                 resource_type="Hospital" if needs_medical else "Shelter",
                 require_inclusive=is_inclusive,
             )
+
+            # External shelter fallback
+            if not nearest:
+                nearest = _find_external_resource(
+                    incident["lat"], incident["lon"],
+                    "Hospital" if needs_medical else "Shelter",
+                    push_sse,
+                )
+                if nearest:
+                    _log_dispatch_event(iid, "SHELTER_FALLBACK",
+                                        f"Local capacity exhausted. Fallback to {nearest['name']}.")
+
             if nearest:
                 resource_id = nearest["id"]
-                push_sse(f"[Placement] Victims \u2192 {nearest['name']} ({nearest['distance_km']:.1f} km)")
+                push_sse(f"[Placement] Victims → {nearest['name']} ({nearest.get('distance_km', '?')} km)")
 
-            # Schedule auto-complete simulation
+            # Schedule rescue + admission simulation
             _schedule_rescue_complete(assignment_id, unit["id"], iid, eta, resource_id, push_sse)
     else:
         push_sse(f"[Liaison] {emergency_type} incident — agency notified, no rescue unit required.")
-        # For non-flood non-rescue types, still find resource
         resources = _fetch_resources()
         nearest   = nearest_resource(incident["lat"], incident["lon"], resources,
                                       resource_type="Hospital" if incident.get("medical_cnt", 0) > 0 else "Shelter")
+        if not nearest:
+            nearest = _find_external_resource(
+                incident["lat"], incident["lon"],
+                "Hospital" if incident.get("medical_cnt", 0) > 0 else "Shelter",
+                push_sse,
+            )
         if nearest:
             resource_id = nearest["id"]
 
@@ -626,17 +815,18 @@ def simulate_vip_bribe(incident_id: int, vip_name: str = "Unnamed VIP"):
     conn = get_connection()
     conn.execute(
         """INSERT INTO audit_logs (incident_id, agent, decision, reasoning, citation)
-           VALUES (?, 'Strategy Lead', 'VIP_BLOCKED', ?, 'DM Act 2005, Section 38(2)')""",
+           VALUES (?, 'Strategy Lead', 'VIP_BLOCKED', ?, ?)""",
         (incident_id,
          f"VIP override attempt by '{vip_name}' BLOCKED. "
-         f"DM Act 2005 mandates severity-based triage. No political status may alter allocation.")
+         f"DM Act 2005 mandates severity-based triage. No political status may alter allocation.",
+         DM_ACT_CITATIONS["triage_approval"])
     )
     conn.commit()
     conn.close()
     return {
         "status": "VIP_BLOCKED",
         "message": f"Override attempt by '{vip_name}' rejected and logged.",
-        "legal_basis": "DM Act 2005, Section 38(2)"
+        "legal_basis": DM_ACT_CITATIONS["triage_approval"],
     }
 
 

@@ -127,7 +127,7 @@ def init_db():
         is_disability       INTEGER DEFAULT 0,
         severity            TEXT    DEFAULT 'Low' CHECK(severity IN ('Critical','High','Medium','Low')),
         status              TEXT    DEFAULT 'Reported' CHECK(status IN
-                                ('Reported','Evacuated','Admitted','Sheltered')),
+                                ('Reported','Evacuated','In_Transit','Admitted','Sheltered')),
         assigned_resource_id INTEGER,
         placed_at           DATETIME,
         FOREIGN KEY (incident_id) REFERENCES incidents(id),
@@ -160,7 +160,8 @@ def init_db():
         event_type  TEXT    CHECK(event_type IN
                         ('UNIT_ASSIGNED','DISPATCHED','RESCUE_COMPLETE',
                          'VICTIM_PLACED','UNIT_RETURNED','FRAUD_ALERT',
-                         'VIP_BLOCKED','ULTRA_PRIORITY','TRIAGE_COMPLETE')),
+                         'VIP_BLOCKED','ULTRA_PRIORITY','TRIAGE_COMPLETE','OVERRIDE',
+                         'ADMISSION_START','ADMISSION_COMPLETE','SHELTER_FALLBACK')),
         message     TEXT    NOT NULL,
         timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (incident_id) REFERENCES incidents(id)
@@ -170,10 +171,13 @@ def init_db():
     CREATE TABLE IF NOT EXISTS audit_logs (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
         incident_id     INTEGER,
+        aadhar_id       TEXT,
         agent           TEXT,
-        decision        TEXT    CHECK(decision IN ('APPROVED','REJECTED','REDIRECTED','VIP_BLOCKED','FRAUD_ALERT')),
+        decision        TEXT    CHECK(decision IN ('APPROVED','REJECTED','REDIRECTED','VIP_BLOCKED','FRAUD_ALERT','OVERRIDE','CONSENSUS')),
         reasoning       TEXT,
         citation        TEXT,
+        fleet_check     TEXT,
+        consensus_score REAL,
         timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (incident_id) REFERENCES incidents(id)
     );

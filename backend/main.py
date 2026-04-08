@@ -10,7 +10,9 @@ Endpoints:
   GET  /api/rescue-units         — Live rescue fleet status
   GET  /api/victims              — Victim placement tracking
   GET  /api/dispatch-events/{id} — Incident timeline
-  POST /api/incident             — Submit new SOS triage
+  POST /api/incident             — Submit new SOS triage (legacy)
+  POST /api/sos                  — Submit chatbot-based SOS triage (v2.0)
+  GET  /api/notifications/latest — Latest SOS notification for admin toast
   POST /api/vip-bribe            — Simulate VIP bribe (test)
   GET  /api/stream/{id}          — SSE stream of agent thought trace
   GET  /api/health               — DB health check
@@ -29,12 +31,15 @@ from typing import Optional, AsyncGenerator, List
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from database import get_connection, init_db
 from haversine import rank_resources, nearest_agency
 from agents import run_crew_and_dispatch, simulate_vip_bribe
 from priority_engine import engine as priority_engine
+
+# ── Configurable Admission Delay ──────────────────────────────────────────────
+ADMISSION_DELAY_SECONDS = int(os.getenv("ADMISSION_DELAY_SECONDS", "600"))
 
 # ── App Setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -60,7 +65,7 @@ VIP_KEYWORDS = {"vip", "minister", "celebrity", "mla", "mp", "ias", "ips", "coll
 @app.on_event("startup")
 def on_startup():
     init_db()
-    print("[API] Sentinel-AI v2.0 started.")
+    print(f"[API] Sentinel-AI v2.0 started. Admission delay: {ADMISSION_DELAY_SECONDS}s")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -96,6 +101,58 @@ class IncidentIn(BaseModel):
     lon:            float
 
 
+# ── Chatbot SOS Models (v2.0) ─────────────────────────────────────────────────
+
+class VictimDetail(BaseModel):
+    name:             str
+    phone:            str
+    aadhaar:          str
+    category:         str = Field(..., pattern="^(Male|Female|Child)$")
+    lgbtq_shelter:    bool = False
+    disability_access: bool = False
+    medical_need:     bool = False
+    severity:         str = Field(default="Low", pattern="^(Critical|High|Medium|Low)$")
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v):
+        digits = "".join(c for c in v if c.isdigit())
+        if len(digits) != 10:
+            raise ValueError("Phone number must be exactly 10 digits")
+        return digits
+
+    @field_validator("aadhaar")
+    @classmethod
+    def validate_aadhaar(cls, v):
+        digits = "".join(c for c in v if c.isdigit())
+        if len(digits) != 12:
+            raise ValueError("Aadhaar ID must be exactly 12 digits")
+        return digits
+
+
+class SimplifiedVictim(BaseModel):
+    """For groups > 10: only category + severity needed."""
+    category:      str = Field(..., pattern="^(Male|Female|Child)$")
+    medical_need:  bool = False
+    severity:      str = Field(default="Low", pattern="^(Critical|High|Medium|Low)$")
+
+
+class ChatbotSOSIn(BaseModel):
+    """Chatbot triage submission from /sos page."""
+    # Phase 1: General triage
+    victim_count:    int = Field(..., ge=1)
+    lat:             float
+    lon:             float
+    flood_level:     int = Field(..., ge=1, le=3)  # 1=Ankle, 2=Waist, 3=Overhead
+    hazards:         list[str] = []  # ["Fire Hazards", "Electrical Shortages", "Sewage Contamination"]
+    extra_comments:  Optional[str] = None
+
+    # Phase 2: Individual victims (full details for up to 2 if N>10)
+    victims:         list[VictimDetail] = []
+    # Simplified victim data (for N>10, the remaining N-2)
+    simplified_victims: list[SimplifiedVictim] = []
+
+
 class VipBribeIn(BaseModel):
     incident_id: int
     vip_name:    str = "Unknown VIP"
@@ -104,6 +161,19 @@ class VipBribeIn(BaseModel):
 # ══════════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Chatbot flood level → DB flood level mapping
+CHATBOT_FLOOD_MAP = {1: 1, 2: 2, 3: 3}
+# Layman labels for admin display
+FLOOD_LAYMAN_LABELS = {
+    0: "No Flood",
+    1: "Level 1: Ankle — Water is low; watch for hidden drains",
+    2: "Level 2: Waist — Deep/strong water; dangerous to move",
+    3: "Level 3: Overhead — Ground floor submerged; roof/upper floor",
+    4: "Level 4: Total Isolation (Internal)",
+    5: "Level 5: Collapse/Washout (Internal)",
+}
+
 
 def _rows_to_list(rows) -> list[dict]:
     return [dict(r) for r in rows]
@@ -146,7 +216,7 @@ def _log_dispatch_event_api(incident_id: int, event_type: str, message: str):
 
 
 def _insert_victims(incident_id: int, data: IncidentIn):
-    """Create individual victim records from demographics."""
+    """Create individual victim records from demographics (legacy endpoint)."""
     conn = get_connection()
     records = []
     severity = data.severity
@@ -173,6 +243,41 @@ def _insert_victims(incident_id: int, data: IncidentIn):
     conn.close()
 
 
+def _insert_chatbot_victims(incident_id: int, data: ChatbotSOSIn):
+    """Create individual victim records from chatbot triage data."""
+    conn = get_connection()
+    records = []
+
+    # Full-detail victims
+    for v in data.victims:
+        records.append((
+            incident_id, v.name, v.phone, v.aadhaar,
+            v.category,
+            1 if v.medical_need else 0,
+            1 if v.lgbtq_shelter else 0,
+            1 if v.disability_access else 0,
+            v.severity if v.medical_need else "Low",
+        ))
+
+    # Simplified victims (N>10 overflow)
+    for i, sv in enumerate(data.simplified_victims):
+        records.append((
+            incident_id, f"{sv.category}-Extra-{i+1}", None, None,
+            sv.category,
+            1 if sv.medical_need else 0,
+            0, 0,
+            sv.severity if sv.medical_need else "Low",
+        ))
+
+    conn.executemany("""
+        INSERT INTO victims (incident_id, name, phone, aadhar_id, gender,
+                             needs_medical, is_lgbtq, is_disability, severity)
+        VALUES (?,?,?,?,?,?,?,?,?)
+    """, records)
+    conn.commit()
+    conn.close()
+
+
 def _run_crew_async(incident: dict):
     """Run the CrewAI crew in a background thread, pushing to SSE."""
     incident_id = incident["id"]
@@ -189,6 +294,33 @@ def _run_crew_async(incident: dict):
         _push_sse(incident_id, f"[DONE] {result}")
     except Exception as e:
         _push_sse(incident_id, f"[ERROR] {str(e)}")
+
+
+def _compute_hazards_from_list(hazards: list[str]) -> tuple[int, int, str]:
+    """Convert chatbot hazard checkboxes to fire_hzd, power_hzd, emergency_type."""
+    fire_hzd = 1 if "Fire Hazards" in hazards else 0
+    power_hzd = 1 if "Electrical Shortages" in hazards else 0
+
+    if fire_hzd:
+        emergency_type = "Fire"
+    elif power_hzd:
+        emergency_type = "Electrical"
+    elif "Sewage Contamination" in hazards:
+        emergency_type = "Sewage"
+    else:
+        emergency_type = "Flood"
+
+    return fire_hzd, power_hzd, emergency_type
+
+
+def _mask_aadhaar(aadhaar: str) -> str:
+    """Mask Aadhaar for admin display: XXXX-XXXX-1234"""
+    if not aadhaar:
+        return None
+    digits = "".join(c for c in aadhaar if c.isdigit())
+    if len(digits) != 12:
+        return aadhaar
+    return f"XXXX-XXXX-{digits[-4:]}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -314,7 +446,13 @@ def get_victims(incident_id: Optional[int] = None, status: Optional[str] = None)
     base += " ORDER BY v.incident_id DESC, v.id"
     rows = conn.execute(base, params).fetchall()
     conn.close()
-    return _rows_to_list(rows)
+    # Mask Aadhaar for privacy
+    result = []
+    for row in rows:
+        d = dict(row)
+        d["aadhar_id_masked"] = _mask_aadhaar(d.get("aadhar_id"))
+        result.append(d)
+    return result
 
 
 @app.get("/api/dispatch-events/{incident_id}")
@@ -338,6 +476,40 @@ def get_nearest(lat: float, lon: float, type: str = "Hospital", inclusive: int =
     return ranked
 
 
+@app.get("/api/notifications/latest")
+def get_latest_notification():
+    """Latest SOS notification summary for admin toast popups."""
+    conn = get_connection()
+    # Count victims from recent non-resolved incidents
+    shelter_row = conn.execute("""
+        SELECT COUNT(*) FROM victims v
+        JOIN incidents i ON v.incident_id = i.id
+        WHERE i.status != 'Resolved' AND v.needs_medical = 0 AND v.status = 'Reported'
+    """).fetchone()
+    medical_row = conn.execute("""
+        SELECT COUNT(*) FROM victims v
+        JOIN incidents i ON v.incident_id = i.id
+        WHERE i.status != 'Resolved' AND v.needs_medical = 1 AND v.status = 'Reported'
+    """).fetchone()
+    # Latest incident for notification trigger
+    latest = conn.execute("""
+        SELECT id, timestamp, total_victims FROM incidents ORDER BY timestamp DESC LIMIT 1
+    """).fetchone()
+    conn.close()
+    return {
+        "shelter_needed": shelter_row[0] if shelter_row else 0,
+        "medical_needed": medical_row[0] if medical_row else 0,
+        "latest_incident_id": dict(latest)["id"] if latest else None,
+        "latest_timestamp": dict(latest)["timestamp"] if latest else None,
+    }
+
+
+@app.get("/api/flood-labels")
+def get_flood_labels():
+    """Return layman flood level labels for admin display."""
+    return FLOOD_LAYMAN_LABELS
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTES — WRITE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -345,8 +517,8 @@ def get_nearest(lat: float, lon: float, type: str = "Hospital", inclusive: int =
 @app.post("/api/incident", status_code=201)
 def create_incident(data: IncidentIn, background_tasks: BackgroundTasks):
     """
-    Submit a new SOS. Runs fraud check, VIP filter, ULTRA_PRIORITY logic,
-    creates victim records, then kicks off the agent crew in background.
+    Submit a new SOS (legacy form endpoint). Runs fraud check, VIP filter,
+    ULTRA_PRIORITY logic, creates victim records, then kicks off agent crew.
     """
 
     # ── Fraud Check ───────────────────────────────────────────────────────
@@ -425,6 +597,158 @@ def create_incident(data: IncidentIn, background_tasks: BackgroundTasks):
     }
 
 
+@app.post("/api/sos", status_code=201)
+def create_chatbot_sos(data: ChatbotSOSIn, background_tasks: BackgroundTasks):
+    """
+    v2.0 Chatbot SOS endpoint. Processes sequential triage from /sos page.
+    Creates individual victim records with Aadhaar, returns per-victim ETA & destination.
+    """
+    from haversine import nearest_resource
+
+    # ── Fraud Check on all detailed victims ───────────────────────────────
+    for v in data.victims:
+        if _check_fraud(v.aadhaar):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "status": "FRAUD_ALERT",
+                    "message": f"Aadhaar {_mask_aadhaar(v.aadhaar)} is blacklisted. Request rejected.",
+                    "aadhaar_masked": _mask_aadhaar(v.aadhaar),
+                }
+            )
+
+    # ── VIP Filter ────────────────────────────────────────────────────────
+    vip_flagged = 1 if _check_vip(data.extra_comments) else 0
+
+    # ── Compute demographics ──────────────────────────────────────────────
+    all_victims = list(data.victims) + [
+        VictimDetail(name=f"{sv.category}-{i}", phone="0000000000", aadhaar="000000000000",
+                     category=sv.category, medical_need=sv.medical_need, severity=sv.severity)
+        for i, sv in enumerate(data.simplified_victims)
+    ]
+    male_cnt = sum(1 for v in all_victims if v.category == "Male")
+    female_cnt = sum(1 for v in all_victims if v.category == "Female")
+    child_cnt = sum(1 for v in all_victims if v.category == "Child")
+    total_victims = data.victim_count
+    medical_cnt = sum(1 for v in all_victims if v.medical_need)
+    shelter_cnt = total_victims - medical_cnt
+
+    # Compute highest severity
+    severity_order = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
+    max_severity = max(
+        (v.severity for v in all_victims if v.medical_need),
+        key=lambda s: severity_order.get(s, 0),
+        default="Low"
+    )
+
+    priority = "ULTRA_PRIORITY" if total_victims > 20 else "Standard"
+
+    # ── Hazard processing ─────────────────────────────────────────────────
+    fire_hzd, power_hzd, emergency_type = _compute_hazards_from_list(data.hazards)
+    db_flood_level = CHATBOT_FLOOD_MAP.get(data.flood_level, data.flood_level)
+
+    # ── Priority Score ────────────────────────────────────────────────────
+    is_lgbtq = 1 if any(v.lgbtq_shelter for v in data.victims) else 0
+    is_disability = 1 if any(v.disability_access for v in data.victims) else 0
+
+    incident_dict = {
+        "phone": data.victims[0].phone if data.victims else "0000000000",
+        "victim_name": data.victims[0].name if data.victims else "Group SOS",
+        "aadhar_id": data.victims[0].aadhaar if data.victims else None,
+        "male_cnt": male_cnt, "female_cnt": female_cnt, "child_cnt": child_cnt,
+        "total_victims": total_victims,
+        "severity": max_severity, "priority": priority,
+        "medical_cnt": medical_cnt, "shelter_cnt": shelter_cnt,
+        "is_lgbtq": is_lgbtq, "is_disability": is_disability,
+        "fire_hzd": fire_hzd, "power_hzd": power_hzd,
+        "emergency_type": emergency_type, "flood_level": db_flood_level,
+        "extra_comments": data.extra_comments,
+        "lat": data.lat, "lon": data.lon,
+    }
+    score, raw_score = priority_engine.score_incident(incident_dict)
+
+    # ── Insert Incident ───────────────────────────────────────────────────
+    conn = get_connection()
+    cur = conn.execute("""
+        INSERT INTO incidents
+        (phone, victim_name, aadhar_id,
+         male_cnt, female_cnt, child_cnt, total_victims,
+         severity, priority, medical_cnt, shelter_cnt,
+         is_lgbtq, is_disability, fire_hzd, power_hzd,
+         emergency_type, flood_level, vip_flagged, extra_comments,
+         lat, lon, status)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Pending')
+    """, (
+        incident_dict["phone"], incident_dict["victim_name"], incident_dict["aadhar_id"],
+        male_cnt, female_cnt, child_cnt, total_victims,
+        max_severity, priority, medical_cnt, shelter_cnt,
+        is_lgbtq, is_disability, fire_hzd, power_hzd,
+        emergency_type, db_flood_level, vip_flagged, data.extra_comments,
+        data.lat, data.lon,
+    ))
+    incident_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    # ── Insert Individual Victims with Aadhaar ────────────────────────────
+    _insert_chatbot_victims(incident_id, data)
+
+    # ── Log Events ────────────────────────────────────────────────────────
+    if vip_flagged:
+        _log_dispatch_event_api(incident_id, "VIP_BLOCKED",
+                                "VIP reference detected. Request proceeds on merit only.")
+    if priority == "ULTRA_PRIORITY":
+        _log_dispatch_event_api(incident_id, "ULTRA_PRIORITY",
+                                f"ULTRA_PRIORITY: {total_victims} victims detected.")
+
+    # ── Compute per-victim destination for SOS response ───────────────────
+    resources = _rows_to_list(
+        get_connection().execute("SELECT * FROM resources WHERE status='Active'").fetchall()
+    )
+
+    victim_allotments = []
+    for v in data.victims:
+        needs_med = v.medical_need
+        is_incl = v.lgbtq_shelter or v.disability_access
+        dest = nearest_resource(
+            data.lat, data.lon, resources,
+            resource_type="Hospital" if needs_med else "Shelter",
+            require_inclusive=is_incl,
+        )
+        # External shelter fallback: if no local resource found, search without type filter
+        if not dest:
+            dest = nearest_resource(data.lat, data.lon, resources, require_available=True)
+
+        victim_allotments.append({
+            "name": v.name,
+            "aadhaar_masked": _mask_aadhaar(v.aadhaar),
+            "destination": dest["name"] if dest else "Searching external facilities...",
+            "destination_type": dest.get("type", "Unknown") if dest else "Unknown",
+            "eta_minutes": dest.get("eta_min", 0) if dest else None,
+            "distance_km": dest.get("distance_km", 0) if dest else None,
+        })
+
+    # ── Kick Off Agent Crew ───────────────────────────────────────────────
+    full_incident = incident_dict.copy()
+    full_incident["id"] = incident_id
+
+    background_tasks.add_task(
+        threading.Thread(target=_run_crew_async, args=(full_incident,), daemon=True).start
+    )
+
+    return {
+        "incident_id": incident_id,
+        "status": "Pending",
+        "priority": priority,
+        "total_victims": total_victims,
+        "priority_score": score,
+        "vip_flagged": bool(vip_flagged),
+        "coordinates": {"lat": data.lat, "lon": data.lon},
+        "flood_level_label": FLOOD_LAYMAN_LABELS.get(db_flood_level, f"Level {db_flood_level}"),
+        "victim_allotments": victim_allotments,
+    }
+
+
 @app.post("/api/vip-bribe")
 def vip_bribe(data: VipBribeIn):
     result = simulate_vip_bribe(data.incident_id, data.vip_name)
@@ -481,7 +805,10 @@ def health():
         "fraud_entries": conn.execute("SELECT COUNT(*) FROM fraud_db").fetchone()[0],
     }
     conn.close()
-    return {"status": "ok", "version": "2.0", "db_counts": counts}
+    return {
+        "status": "ok", "version": "2.0", "db_counts": counts,
+        "admission_delay_seconds": ADMISSION_DELAY_SECONDS,
+    }
 
 
 if __name__ == "__main__":

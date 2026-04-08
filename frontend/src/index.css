@@ -45,8 +45,47 @@
     @apply relative overflow-hidden bg-[#2979ff]/10 text-[#2979ff] border border-[#2979ff]/50 px-4 py-2 rounded-lg font-bold tracking-wider text-[12px] uppercase transition-all duration-300 hover:bg-[#2979ff]/20 hover:shadow-[0_0_15px_rgba(41,121,255,0.4)] active:scale-95;
   }
 
+  .btn-success {
+    @apply relative overflow-hidden bg-[#00e676]/10 text-[#00e676] border border-[#00e676]/50 px-4 py-2 rounded-lg font-bold tracking-wider text-[12px] uppercase transition-all duration-300 hover:bg-[#00e676]/20 hover:shadow-[0_0_15px_rgba(0,230,118,0.4)] active:scale-95;
+  }
+
   .input-field {
     @apply bg-[#0a1624] border border-[#1e3050] rounded-md text-[#c8d8e8] px-3 py-2 text-sm font-mono w-full focus:outline-none focus:border-[#2979ff] focus:ring-1 focus:ring-[#2979ff] transition-all;
+  }
+
+  /* ── SOS Chatbot Styles ──────────────────────────────────────────────── */
+  .sos-input {
+    @apply bg-[#0a1624] border border-[#1e3050] rounded-xl text-[#c8d8e8] px-4 py-3 text-sm font-mono w-full focus:outline-none focus:border-[#2979ff] focus:ring-1 focus:ring-[#2979ff] transition-all;
+  }
+
+  .sos-btn {
+    @apply bg-gradient-to-r from-[#2979ff]/20 to-[#2979ff]/10 text-[#2979ff] border border-[#2979ff]/50 px-6 py-3 rounded-xl font-bold tracking-wider text-xs uppercase transition-all duration-300 hover:from-[#2979ff]/40 hover:to-[#2979ff]/20 hover:shadow-[0_0_20px_rgba(41,121,255,0.4)] hover:border-[#2979ff] active:scale-95;
+  }
+
+  .sos-btn-secondary {
+    @apply bg-[#1a2535]/50 text-gray-400 border border-[#1e3050] px-6 py-3 rounded-xl font-bold tracking-wider text-xs uppercase transition-all duration-300 hover:bg-[#1a2535] hover:text-gray-200 hover:border-[#2979ff]/30 active:scale-95;
+  }
+
+  .sos-input-area {
+    @apply flex gap-3 p-3 bg-[#06101c]/80 border border-[#1e3050] rounded-2xl backdrop-blur-lg;
+  }
+
+  /* ── Coordinate Display — High Contrast for Radio Readout ───────────── */
+  .coord-display {
+    @apply bg-[#0a1624] border-2 border-[#2979ff]/40 rounded-xl p-4;
+  }
+
+  .coord-readout {
+    @apply bg-[#0a1420] border-2 border-[#f5c518]/60 rounded-xl p-4 shadow-[0_0_20px_rgba(245,197,24,0.15)];
+    background: linear-gradient(135deg, #0a1420 0%, #0d1a2e 100%);
+  }
+
+  /* ── Notification Toast ──────────────────────────────────────────────── */
+  .notification-toast {
+    @apply fixed top-20 right-6 z-[9000] max-w-md;
+    @apply bg-[#0d1f35] border-2 border-[#ff2d2d]/50 rounded-xl p-4 backdrop-blur-lg;
+    @apply shadow-[0_0_30px_rgba(255,45,45,0.3)];
+    animation: toast-slide-in 0.5s cubic-bezier(0.16, 1, 0.3, 1);
   }
 }
 
@@ -56,6 +95,8 @@
   }
 }
 
+/* ── Animations ────────────────────────────────────────────────────────── */
+
 @keyframes pulse-glow {
   0%, 100% {
     opacity: 1;
@@ -64,5 +105,49 @@
   50% {
     opacity: .5;
     box-shadow: 0 0 5px currentColor;
+  }
+}
+
+/* Chat bubble entrance */
+@keyframes chat-bubble-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.chat-bubble-enter {
+  animation: chat-bubble-in 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Typing dots */
+@keyframes typing-bounce {
+  0%, 60%, 100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-6px);
+    opacity: 1;
+  }
+}
+
+.typing-dot {
+  animation: typing-bounce 1.2s ease-in-out infinite;
+}
+
+/* Toast slide-in */
+@keyframes toast-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(60px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
   }
 }

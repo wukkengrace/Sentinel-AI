@@ -62,15 +62,21 @@ function LeafletMap({ incidents, resources, rescueUnits }) {
 
     incidents.forEach(inc => {
       if (!inc.lat || !inc.lon || inc.status === 'Resolved') return;
+      const isPaused = inc.status === 'PAUSED_BY_OVERRIDE';
       const c = inc.flood_level > 0 ? FLOOD_COLORS[inc.flood_level] : (inc.severity === 'Critical' ? '#ff2d2d' : inc.severity === 'High' ? '#ff8c00' : inc.severity === 'Medium' ? '#f5c518' : '#00e676');
+      const markerColor = isPaused ? '#ff8c00' : c;
+      const markerBorder = isPaused ? '#6b7280' : '#fff';
+      const animClass = isPaused ? 'animate-pulse'
+        : inc.priority === 'ULTRA_PRIORITY' ? 'animate-bounce'
+        : inc.severity === 'Critical' ? 'animate-pulse' : '';
       const icon = window.L.divIcon({
         className: "", iconSize: [24, 24], iconAnchor: [12, 12],
-        html: `<div class="${inc.priority === 'ULTRA_PRIORITY' ? 'animate-bounce' : inc.severity === 'Critical' ? 'animate-pulse' : ''}" style="width:20px;height:20px;border-radius:50%;background:${c};
-              border:2px solid #fff;box-shadow:0 0 12px ${c};">&nbsp;</div>`
+        html: `<div class="${animClass}" style="width:20px;height:20px;border-radius:50%;background:${markerColor};
+              border:2px solid ${markerBorder};box-shadow:0 0 12px ${markerColor};">&nbsp;</div>`
       });
       const m = window.L.marker([inc.lat, inc.lon], { icon })
         .addTo(map)
-        .bindPopup(`<b>INC #${inc.id}</b><br>${inc.victim_name || inc.phone}<br>Emergency: ${inc.emergency_type}<br>Severity: ${inc.severity}<br>Victims: ${inc.total_victims}`);
+        .bindPopup(`<b>INC #${inc.id}</b>${isPaused ? ' ⏸ <b style="color:#ff8c00">PAUSED</b>' : ''}<br>${inc.victim_name || inc.phone}<br>Emergency: ${inc.emergency_type}<br>Severity: ${inc.severity}<br>Victims: ${inc.total_victims}<br>Status: ${inc.status}`);
       markersRef.current.push(m);
     });
 
@@ -98,6 +104,7 @@ function LeafletMap({ incidents, resources, rescueUnits }) {
       <div ref={mapRef} className="h-[420px] rounded-xl border border-[rgba(30,48,80,0.5)] shadow-[0_0_20px_rgba(41,121,255,0.1)] z-10" />
       <div className="absolute top-3 right-3 bg-[rgba(5,12,24,0.85)] backdrop-blur border border-[rgba(30,48,80,0.5)] rounded-lg p-2 z-[1000] text-[10px] space-y-1 text-gray-300 shadow-lg">
         <div className="text-[#ff2d2d] font-bold">● Incident</div>
+        <div className="text-[#ff8c00]">⏸ Paused (Override)</div>
         <div className="text-[#00e676]">🏥 Hospital / ⛺ Shelter</div>
         <div className="text-[#2979ff]">🚒 Rescue Unit (Avail)</div>
         <div className="text-[#ff8c00]">🚒 Rescue Unit (Deployed)</div>
@@ -144,6 +151,9 @@ function ThoughtTrace({ incidentId, events, autoStart }) {
     if(l.startsWith("[Priority Engine]")) return "text-[#ff2d2d] font-bold";
     if(l.startsWith("[Fleet Gate]")) return "text-[#ff8c00] font-bold";
     if(l.startsWith("[Override]")) return "text-[#ff8c00] bg-[#ff8c00]/10 inline p-1 rounded font-bold";
+    if(l.includes("[OVERRIDE_PAUSE]")) return "text-[#ff8c00] bg-[#ff8c00]/10 inline p-1 rounded font-bold";
+    if(l.includes("[OVERRIDE_RESUME]")) return "text-[#00e676] bg-[#00e676]/10 inline p-1 rounded font-bold";
+    if(l.startsWith("[Admission Paused]")) return "text-[#ff8c00] bg-[#ff8c00]/10 inline p-1 rounded font-bold";
     if(l.startsWith("[Admission]")) return "text-[#bf00ff]";
     if(l.startsWith("[Shelter Fallback]")) return "text-[#f5c518] bg-[#f5c518]/10 inline p-1 rounded font-bold";
     if(l.startsWith("[DONE]") || l.startsWith("[Rescue Complete]") || l.startsWith("[Admission Complete]")) return "text-[#00e676] bg-[#00e676]/10 inline p-1 rounded font-bold";

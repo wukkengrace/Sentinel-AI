@@ -18,6 +18,105 @@ def get_connection():
     return conn
 
 
+def _apply_schema_migrations(conn):
+    """
+    Idempotent v2.1 schema migrations.
+    Safe to run on both fresh and existing databases.
+    """
+    # ── Migration A: incidents — add PAUSED_BY_OVERRIDE status + paused_by_incident_id column ──
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='incidents'"
+    ).fetchone()
+    if row and 'PAUSED_BY_OVERRIDE' not in row[0]:
+        conn.execute("ALTER TABLE incidents RENAME TO incidents_v1")
+        conn.execute("""
+        CREATE TABLE incidents (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone           TEXT    NOT NULL,
+            victim_name     TEXT,
+            aadhar_id       TEXT,
+            male_cnt        INTEGER DEFAULT 0,
+            female_cnt      INTEGER DEFAULT 0,
+            child_cnt       INTEGER DEFAULT 0,
+            total_victims   INTEGER DEFAULT 0,
+            severity        TEXT    CHECK(severity IN ('Critical','High','Medium','Low')),
+            priority        TEXT    DEFAULT 'Standard' CHECK(priority IN ('Standard','ULTRA_PRIORITY')),
+            medical_cnt     INTEGER DEFAULT 0,
+            shelter_cnt     INTEGER DEFAULT 0,
+            is_lgbtq        INTEGER DEFAULT 0,
+            is_disability   INTEGER DEFAULT 0,
+            fire_hzd        INTEGER DEFAULT 0,
+            power_hzd       INTEGER DEFAULT 0,
+            emergency_type  TEXT    CHECK(emergency_type IN
+                                ('Fire','Electrical','Sewage','Flood','Road','Tree','Other')),
+            flood_level     INTEGER DEFAULT 0 CHECK(flood_level BETWEEN 0 AND 5),
+            vip_flagged     INTEGER DEFAULT 0,
+            extra_comments  TEXT,
+            lat             REAL,
+            lon             REAL,
+            timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP,
+            status          TEXT DEFAULT 'Pending'
+                                CHECK(status IN ('Pending','Triage_Complete',
+                                                 'Dispatched','Rescue_Complete','Resolved',
+                                                 'PAUSED_BY_OVERRIDE')),
+            paused_by_incident_id INTEGER
+        )""")
+        conn.execute("""
+            INSERT INTO incidents
+                (id,phone,victim_name,aadhar_id,male_cnt,female_cnt,child_cnt,total_victims,
+                 severity,priority,medical_cnt,shelter_cnt,is_lgbtq,is_disability,
+                 fire_hzd,power_hzd,emergency_type,flood_level,vip_flagged,extra_comments,
+                 lat,lon,timestamp,status)
+            SELECT
+                id,phone,victim_name,aadhar_id,male_cnt,female_cnt,child_cnt,total_victims,
+                severity,priority,medical_cnt,shelter_cnt,is_lgbtq,is_disability,
+                fire_hzd,power_hzd,emergency_type,flood_level,vip_flagged,extra_comments,
+                lat,lon,timestamp,status
+            FROM incidents_v1
+        """)
+        conn.execute("DROP TABLE incidents_v1")
+        conn.commit()
+        print("[DB] Migration A: incidents table updated (PAUSED_BY_OVERRIDE + paused_by_incident_id)")
+    else:
+        # Fallback: table already has PAUSED_BY_OVERRIDE — just add column if missing
+        try:
+            conn.execute("ALTER TABLE incidents ADD COLUMN paused_by_incident_id INTEGER")
+            conn.commit()
+            print("[DB] Migration C: paused_by_incident_id column added")
+        except Exception:
+            pass  # column already exists
+
+    # ── Migration B: dispatch_events — add OVERRIDE_PAUSE, OVERRIDE_RESUME event types ──
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='dispatch_events'"
+    ).fetchone()
+    if row and 'OVERRIDE_PAUSE' not in row[0]:
+        conn.execute("ALTER TABLE dispatch_events RENAME TO dispatch_events_v1")
+        conn.execute("""
+        CREATE TABLE dispatch_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            incident_id INTEGER NOT NULL,
+            unit_id     INTEGER,
+            event_type  TEXT    CHECK(event_type IN
+                            ('UNIT_ASSIGNED','DISPATCHED','RESCUE_COMPLETE',
+                             'VICTIM_PLACED','UNIT_RETURNED','FRAUD_ALERT',
+                             'VIP_BLOCKED','ULTRA_PRIORITY','TRIAGE_COMPLETE','OVERRIDE',
+                             'ADMISSION_START','ADMISSION_COMPLETE','SHELTER_FALLBACK',
+                             'OVERRIDE_PAUSE','OVERRIDE_RESUME')),
+            message     TEXT    NOT NULL,
+            timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (incident_id) REFERENCES incidents(id)
+        )""")
+        conn.execute("""
+            INSERT INTO dispatch_events (id, incident_id, unit_id, event_type, message, timestamp)
+            SELECT id, incident_id, unit_id, event_type, message, timestamp
+            FROM dispatch_events_v1
+        """)
+        conn.execute("DROP TABLE dispatch_events_v1")
+        conn.commit()
+        print("[DB] Migration B: dispatch_events table updated (OVERRIDE_PAUSE, OVERRIDE_RESUME)")
+
+
 def init_db():
     """Create all tables if they don't exist yet."""
     conn = get_connection()
@@ -111,7 +210,9 @@ def init_db():
         timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP,
         status          TEXT DEFAULT 'Pending'
                             CHECK(status IN ('Pending','Triage_Complete',
-                                             'Dispatched','Rescue_Complete','Resolved'))
+                                             'Dispatched','Rescue_Complete','Resolved',
+                                             'PAUSED_BY_OVERRIDE')),
+        paused_by_incident_id INTEGER
     );
 
     -- ── 5. VICTIMS (Individual Tracking) ────────────────────────────────────
@@ -161,7 +262,8 @@ def init_db():
                         ('UNIT_ASSIGNED','DISPATCHED','RESCUE_COMPLETE',
                          'VICTIM_PLACED','UNIT_RETURNED','FRAUD_ALERT',
                          'VIP_BLOCKED','ULTRA_PRIORITY','TRIAGE_COMPLETE','OVERRIDE',
-                         'ADMISSION_START','ADMISSION_COMPLETE','SHELTER_FALLBACK')),
+                         'ADMISSION_START','ADMISSION_COMPLETE','SHELTER_FALLBACK',
+                         'OVERRIDE_PAUSE','OVERRIDE_RESUME')),
         message     TEXT    NOT NULL,
         timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (incident_id) REFERENCES incidents(id)
@@ -204,8 +306,12 @@ def init_db():
     """)
 
     conn.commit()
+
+    # Apply v2.1 migrations for existing databases
+    _apply_schema_migrations(conn)
+
     conn.close()
-    print("[DB] v2.0 Schema initialised at", DB_PATH)
+    print("[DB] v2.1 Schema initialised at", DB_PATH)
 
 
 if __name__ == "__main__":

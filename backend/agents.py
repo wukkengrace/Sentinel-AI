@@ -40,6 +40,10 @@ from priority_engine import engine as priority_engine, DM_ACT_CITATIONS
 # ── Configurable Admission Delay ──────────────────────────────────────────────
 ADMISSION_DELAY_SECONDS = int(os.getenv("ADMISSION_DELAY_SECONDS", "600"))
 
+# ── Admission Cancellation Registry (for override preemption) ─────────────────
+_ADMISSION_CANCEL_EVENTS: Dict[int, threading.Event] = {}
+_ADMISSION_LOCK = threading.Lock()
+
 
 # ── LLM Factories ─────────────────────────────────────────────────────────────
 
@@ -218,12 +222,32 @@ def _complete_admission(incident_id: int, resource_id: int, push_sse):
     Simulate hospital/shelter check-in with configurable delay.
     Resource capacity is ONLY decremented AFTER the delay completes.
     """
+    # Guard: if override happened before admission even started, exit immediately
+    conn = get_connection()
+    status_row = conn.execute("SELECT status FROM incidents WHERE id=?", (incident_id,)).fetchone()
+    conn.close()
+    if status_row and dict(status_row)["status"] == "PAUSED_BY_OVERRIDE":
+        return  # Pre-empted before admission started; resumption handled by _restart_admission_for_paused
+
     _log_dispatch_event(incident_id, "ADMISSION_START",
                         f"Admission simulation started ({ADMISSION_DELAY_SECONDS}s delay). Victims In-Transit.")
     push_sse(f"[Admission] 🏥 Check-in simulation started — {ADMISSION_DELAY_SECONDS}s delay...")
 
-    # The 10-minute mock sleep (configurable)
-    time.sleep(ADMISSION_DELAY_SECONDS)
+    # Cancellable sleep: threading.Event.wait returns True if cancelled, False if timed out normally
+    cancel_event = threading.Event()
+    with _ADMISSION_LOCK:
+        _ADMISSION_CANCEL_EVENTS[incident_id] = cancel_event
+
+    cancelled = cancel_event.wait(timeout=ADMISSION_DELAY_SECONDS)
+
+    with _ADMISSION_LOCK:
+        _ADMISSION_CANCEL_EVENTS.pop(incident_id, None)
+
+    if cancelled:
+        push_sse(f"[Admission Paused] ⏸ Incident #{incident_id} admission preempted by override. Timer deleted.")
+        _log_dispatch_event(incident_id, "OVERRIDE_PAUSE",
+                            f"Admission timer cancelled for incident #{incident_id} — preempted by higher-priority override. Will reset to {ADMISSION_DELAY_SECONDS}s on resume.")
+        return  # early exit — do NOT commit victims or decrement capacity
 
     conn = get_connection()
     if resource_id:
@@ -278,11 +302,26 @@ def _schedule_rescue_complete(assignment_id: int, unit_id: int, incident_id: int
                WHERE id=?""",
             (assignment_id,)
         )
+        # Conditional update: don't overwrite PAUSED_BY_OVERRIDE if override happened
+        # during the 2s rescue simulation window
         conn.execute(
-            "UPDATE incidents SET status='Rescue_Complete' WHERE id=?", (incident_id,)
+            "UPDATE incidents SET status='Rescue_Complete' WHERE id=? AND status='Dispatched'",
+            (incident_id,)
+        )
+        # Check if incident was paused by override while we were simulating rescue
+        paused_check = conn.execute(
+            "SELECT status FROM incidents WHERE id=?", (incident_id,)
+        ).fetchone()
+        was_paused_during_rescue = (
+            dict(paused_check)["status"] == "PAUSED_BY_OVERRIDE" if paused_check else False
         )
         conn.commit()
         conn.close()
+
+        if was_paused_during_rescue:
+            # Thread exits — resumption handled by _restart_admission_for_paused
+            push_sse(f"[Override] Incident #{incident_id} was paused during rescue simulation — thread exiting.")
+            return
 
         # Set victims to In-Transit
         _place_victims_in_transit(incident_id)
@@ -312,16 +351,187 @@ def _schedule_rescue_complete(assignment_id: int, unit_id: int, incident_id: int
         # ── Step 3: Start admission simulation (10-minute delay) ──────────
         _complete_admission(incident_id, resource_id, push_sse)
 
-        # Mark incident as resolved after admission
+        # Only mark Resolved + trigger resumptions if admission was NOT cancelled by override.
+        # If it was cancelled, _pause_incident_by_override already set status=PAUSED_BY_OVERRIDE
+        # on the *paused* incident; this incident itself stays at Rescue_Complete until here.
         conn = get_connection()
-        conn.execute(
-            "UPDATE incidents SET status='Resolved' WHERE id=?", (incident_id,)
-        )
-        conn.commit()
+        inc_row = conn.execute(
+            "SELECT status FROM incidents WHERE id=?", (incident_id,)
+        ).fetchone()
+        current_status = dict(inc_row)["status"] if inc_row else None
         conn.close()
+
+        if current_status == "Rescue_Complete":
+            conn = get_connection()
+            conn.execute(
+                "UPDATE incidents SET status='Resolved' WHERE id=?", (incident_id,)
+            )
+            conn.commit()
+            conn.close()
+            # Resume any incidents that were paused because this incident took their unit
+            _resume_paused_incidents(incident_id, push_sse)
 
     t = threading.Thread(target=_complete, daemon=True)
     t.start()
+
+
+def _pause_incident_by_override(paused_iid: int, new_iid: int, new_score: float, push_sse):
+    """
+    Pauses a displaced incident when a higher-priority override takes its rescue unit.
+    Sets status to PAUSED_BY_OVERRIDE, cancels any active admission timer, and
+    logs a full audit trail per DM Act 2005 Section 34.
+    """
+    # Fetch displaced incident's priority score for the mandatory output message
+    conn = get_connection()
+    paused_row = conn.execute("SELECT * FROM incidents WHERE id=?", (paused_iid,)).fetchone()
+    conn.close()
+    if not paused_row:
+        return
+    paused_data = dict(paused_row)
+    paused_score, _ = priority_engine.score_incident(paused_data)
+
+    # Update displaced incident status
+    conn = get_connection()
+    conn.execute(
+        "UPDATE incidents SET status='PAUSED_BY_OVERRIDE', paused_by_incident_id=? WHERE id=?",
+        (new_iid, paused_iid)
+    )
+    conn.commit()
+    conn.close()
+
+    # Mandatory override output message (per spec)
+    override_msg = (
+        f"Incident #{new_iid} (Priority: {new_score}) has overridden "
+        f"Incident #{paused_iid} (Priority: {paused_score}). "
+        f"Incident #{paused_iid} status set to PAUSED_BY_OVERRIDE — awaiting freed resource."
+    )
+    push_sse(f"[Override] {override_msg}")
+
+    # Log OVERRIDE_PAUSE event on the paused incident's timeline
+    _log_dispatch_event(
+        paused_iid, "OVERRIDE_PAUSE",
+        f"{override_msg} Legal: {DM_ACT_CITATIONS['override']}"
+    )
+
+    # Cancel active admission timer if running
+    with _ADMISSION_LOCK:
+        ev = _ADMISSION_CANCEL_EVENTS.get(paused_iid)
+    if ev:
+        ev.set()  # threading.Event.set() is thread-safe outside the lock
+
+    # Per-victim audit log with DM Act 2005 Section 34 citation
+    conn = get_connection()
+    victims = conn.execute(
+        "SELECT aadhar_id FROM victims WHERE incident_id=?", (paused_iid,)
+    ).fetchall()
+    conn.close()
+    for v in victims:
+        _write_audit(
+            paused_iid,
+            "Strategy Lead",
+            "OVERRIDE",
+            f"Incident #{paused_iid} admission preempted by Incident #{new_iid} "
+            f"(Score: {new_score} vs {paused_score}). "
+            f"Timer deleted. Victims remain In-Transit — full 600s re-evaluation on resume. "
+            f"DM Act 2005 Section 34: interrupted admission requires complete re-evaluation.",
+            citation="DM Act 2005, Section 34",
+            aadhar_id=dict(v).get("aadhar_id"),
+        )
+
+
+def _resume_paused_incidents(completed_iid: int, push_sse):
+    """
+    After an overriding incident completes admission, resume all incidents
+    that were displaced by it — each restarts with a full 600s timer.
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id FROM incidents WHERE status='PAUSED_BY_OVERRIDE' AND paused_by_incident_id=?",
+        (completed_iid,)
+    ).fetchall()
+    conn.close()
+
+    for row in rows:
+        paused_iid = dict(row)["id"]
+        push_sse(
+            f"[Override] Incident #{completed_iid} admission complete — "
+            f"resuming Incident #{paused_iid} with full {ADMISSION_DELAY_SECONDS}s timer."
+        )
+        _restart_admission_for_paused(paused_iid)
+
+
+def _restart_admission_for_paused(paused_iid: int):
+    """
+    Restarts the admission flow for a PAUSED_BY_OVERRIDE incident.
+    Resets status to Rescue_Complete, then fires a new daemon thread
+    to complete the full ADMISSION_DELAY_SECONDS timer and mark Resolved.
+    Resource capacity is only decremented after the full reset timer clears.
+    """
+    conn = get_connection()
+    conn.execute(
+        "UPDATE incidents SET status='Rescue_Complete', paused_by_incident_id=NULL WHERE id=?",
+        (paused_iid,)
+    )
+    # Defensive: ensure victims are still In_Transit (not left in a stale state)
+    conn.execute(
+        """UPDATE victims SET status='In_Transit'
+           WHERE incident_id=? AND status IN ('Reported', 'Evacuated')""",
+        (paused_iid,)
+    )
+    conn.commit()
+
+    # Get resource_id from victims assigned during original dispatch
+    resource_row = conn.execute(
+        "SELECT assigned_resource_id FROM victims WHERE incident_id=? AND assigned_resource_id IS NOT NULL LIMIT 1",
+        (paused_iid,)
+    ).fetchone()
+    resource_id = dict(resource_row)["assigned_resource_id"] if resource_row else None
+
+    # Fetch victim aadhar_ids for audit
+    victims = conn.execute(
+        "SELECT aadhar_id FROM victims WHERE incident_id=?", (paused_iid,)
+    ).fetchall()
+    conn.close()
+
+    # Log OVERRIDE_RESUME event
+    _log_dispatch_event(
+        paused_iid, "OVERRIDE_RESUME",
+        f"Incident #{paused_iid} resumed after override resolved. "
+        f"Admission timer reset to {ADMISSION_DELAY_SECONDS}s (full re-evaluation). "
+        f"Resource #{resource_id}. Legal: {DM_ACT_CITATIONS['override']}"
+    )
+
+    # Per-victim audit with DM Act 2005 Section 34 citation
+    for v in victims:
+        _write_audit(
+            paused_iid,
+            "Strategy Lead",
+            "OVERRIDE",
+            f"Incident #{paused_iid} admission resumed after override priority resolved. "
+            f"Full {ADMISSION_DELAY_SECONDS}s re-evaluation timer started per DM Act 2005 Section 34.",
+            citation="DM Act 2005, Section 34",
+            aadhar_id=dict(v).get("aadhar_id"),
+        )
+
+    def _do_resume():
+        # noop push_sse: dispatch events + audit logs provide full traceability
+        _complete_admission(paused_iid, resource_id, lambda msg: None)
+        # Guard: only mark Resolved if admission wasn't cancelled by a second override
+        conn2 = get_connection()
+        inc_row = conn2.execute(
+            "SELECT status FROM incidents WHERE id=?", (paused_iid,)
+        ).fetchone()
+        current = dict(inc_row)["status"] if inc_row else None
+        conn2.close()
+        if current == "Rescue_Complete":
+            conn3 = get_connection()
+            conn3.execute(
+                "UPDATE incidents SET status='Resolved' WHERE id=?", (paused_iid,)
+            )
+            conn3.commit()
+            conn3.close()
+
+    threading.Thread(target=_do_resume, daemon=True).start()
 
 
 def _get_agencies(category: str) -> list:
@@ -746,6 +956,10 @@ def run_crew_and_dispatch(incident: Dict[str, Any], push_sse) -> str:
                         aadhar_id=aadhar_id,
                         fleet_check=fleet_check_msg,
                     )
+                    # Pause the displaced incident and cancel its admission timer
+                    displaced_incident_id = unit.get('current_incident_id')
+                    if displaced_incident_id:
+                        _pause_incident_by_override(displaced_incident_id, iid, final_score, push_sse)
                 else:
                     push_sse(f"[WARNING] Override approved but no {unit_type} unit found. Requesting mutual aid.")
             else:
